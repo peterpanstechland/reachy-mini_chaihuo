@@ -16,6 +16,7 @@ from chaihuo_reachy.beat_dance import (
     _clamp,
     _compute_smooth_energy_buckets,
     _load_timeline,
+    _timeline_from_audio,
 )
 
 PITCH_BASE_MAX = 22.0  # pitch soft cap
@@ -179,6 +180,49 @@ def test_controller_start_stop(tmp_path) -> None:
     ctl.stop()
     assert not ctl.is_active
     assert reachy.neutral_calls == 1  # returned to neutral
+
+
+def test_timeline_from_audio_uses_detected_tempo(tmp_path) -> None:
+    import wave
+
+    sr = 16000
+    seconds = 5.0
+    n = int(sr * seconds)
+    x = np.zeros(n, dtype=np.int16)
+    step = int(sr * 60.0 / 120.0)
+    for t in range(0, n, step):
+        x[t : t + int(sr * 0.05)] = 12000
+    path = tmp_path / "大东北我的家乡-何玉-官方试听.wav"
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(x.tobytes())
+
+    timeline = _timeline_from_audio(path)
+    assert timeline is not None
+    assert timeline["track_title"] == "大东北我的家乡-何玉-官方试听"
+    assert timeline["tempo"] == pytest.approx(120.0, abs=3)
+    assert timeline["duration"] == pytest.approx(seconds, abs=0.05)
+    assert len(timeline["beats"]) >= 8
+    assert all("energy_bucket" in beat for beat in timeline["beats"])
+
+
+def test_controller_generates_timeline_when_missing(tmp_path) -> None:
+    from chaihuo_reachy.config import Config
+
+    _make_music(tmp_path)
+    reachy = _FakeReachy()
+    cfg = Config(
+        beat_timeline_path=str(tmp_path / "dance" / "missing.json"),
+        beat_music_path=str(tmp_path / "beat.wav"),
+    )
+    ctl = BeatDanceController(reachy, cfg)
+    info = ctl.start()
+    assert info is not None
+    assert (tmp_path / "dance" / "missing.json").is_file()
+    ctl.stop()
+    assert not ctl.is_active
 
 
 def test_controller_start_without_timeline_returns_none(tmp_path) -> None:

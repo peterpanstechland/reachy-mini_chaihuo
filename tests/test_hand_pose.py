@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import io
 import math
+import tarfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import cv2
@@ -16,6 +19,7 @@ from chaihuo_reachy.hand_pose import (
     classify_gesture,
     create_hand_pose_backend,
     decode_hand_poses,
+    ensure_hand_pose_onnx_model,
 )
 
 
@@ -160,3 +164,76 @@ def test_tensorrt_request_never_falls_back_to_torch2trt(
     )
     with pytest.raises(RuntimeError, match="engine incompatible"):
         create_hand_pose_backend(config)
+
+
+def _write_onnx_archive(path: Path, payload: bytes = b"onnx-bytes") -> None:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        info = tarfile.TarInfo(name="Pose-ResNet18-Hand/pose_resnet18_hand.onnx")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+    path.write_bytes(buffer.getvalue())
+
+
+def test_ensure_onnx_model_extracts_archive_without_redownload(tmp_path, monkeypatch) -> None:
+    dest = tmp_path / "hand_pose_resnet18.onnx"
+    archive = tmp_path / "Pose-ResNet18-Hand.tar.gz"
+    _write_onnx_archive(archive)
+
+    def fail_download(*_args, **_kwargs):
+        raise AssertionError("existing archive must not be downloaded again")
+
+    monkeypatch.setattr(hand_pose_module, "_download_file", fail_download)
+    assert ensure_hand_pose_onnx_model(dest) == dest
+    assert dest.read_bytes() == b"onnx-bytes"
+
+
+def test_auto_desktop_uses_onnx_not_tensorrt(monkeypatch, tmp_path) -> None:
+    created: dict[str, str] = {}
+
+    class FakeOnnx:
+        name = "onnx"
+
+        def __init__(self, path, *, threshold=0.15) -> None:
+            created["path"] = str(path)
+            created["threshold"] = str(threshold)
+
+    def fake_ensure(path, **_kwargs):
+        return Path(path)
+
+    monkeypatch.setattr(hand_pose_module, "OnnxHandPoseBackend", FakeOnnx)
+    monkeypatch.setattr(hand_pose_module, "ensure_hand_pose_onnx_model", fake_ensure)
+    monkeypatch.setattr(hand_pose_module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(hand_pose_module.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(
+        hand_pose_module,
+        "TensorRTHandPoseBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("tensorrt should not run")),
+    )
+    config = SimpleNamespace(
+        gesture_backend="auto",
+        target="mac",
+        gesture_onnx_model_path=str(tmp_path / "hand_pose_resnet18.onnx"),
+        gesture_keypoint_confidence=0.15,
+    )
+    backend = create_hand_pose_backend(config)
+    assert backend.name == "onnx"
+    assert created["path"].endswith("hand_pose_resnet18.onnx")
+
+
+def test_auto_jetson_still_uses_tensorrt(monkeypatch) -> None:
+    class FakeTensorRT:
+        name = "tensorrt_fp16"
+
+        def __init__(self, path, *, threshold=0.15) -> None:
+            self.path = path
+
+    monkeypatch.setattr(hand_pose_module, "TensorRTHandPoseBackend", FakeTensorRT)
+    config = SimpleNamespace(
+        gesture_backend="auto",
+        target="jetson",
+        gesture_tensorrt_engine_path="models/hand_pose/hand_pose_resnet18_fp16.engine",
+        gesture_keypoint_confidence=0.15,
+    )
+    backend = create_hand_pose_backend(config)
+    assert backend.name == "tensorrt_fp16"

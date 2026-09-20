@@ -123,6 +123,27 @@ def test_spawn_finds_daemon_beside_venv_python_when_path_is_minimal(
     ]]
 
 
+def test_spawn_clears_ros_pythonpath_for_daemon(monkeypatch, tmp_path) -> None:
+    captured: list[dict] = []
+    daemon = tmp_path / "reachy-mini-daemon"
+    daemon.touch(mode=0o755)
+    monkeypatch.setattr(main_module, "_clear_persisted_startup_app", lambda: None)
+    monkeypatch.setattr(main_module.sys, "executable", str(tmp_path / "python"))
+    monkeypatch.setenv("PYTHONPATH", "/opt/ros/humble/lib/python3.10/site-packages")
+    monkeypatch.setenv("PYTHONHOME", "/opt/ros/humble")
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda command, **kwargs: captured.append(kwargs)
+        or SimpleNamespace(pid=None),
+    )
+
+    main_module._spawn_sdk_daemon_process(Config(daemon_simulation=True))
+
+    env = captured[0]["env"]
+    assert "PYTHONPATH" not in env
+    assert "PYTHONHOME" not in env
+
+
 def test_resolve_serial_recovers_only_unique_candidate(monkeypatch, tmp_path) -> None:
     missing = tmp_path / "missing"
     candidate = tmp_path / "cu.usbmodem-unique"

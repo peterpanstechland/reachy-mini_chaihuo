@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import abc
 import ctypes
+import logging
 import math
 import platform
 import sys
+import tarfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +22,15 @@ from typing import Any, Sequence
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger("chaihuo_reachy.hand_pose")
+
+# Official jetson-inference resnet18-hand archive: 1x3x224x224 → cmap 21 + paf 40.
+NVIDIA_HAND_POSE_ONNX_URL = (
+    "https://nvidia.box.com/shared/static/srfcadyqv4eaeq6lvu5qpsm6l5oatcnq.gz"
+)
+_ONNX_MODEL_LOCK = threading.Lock()
+GESTURE_BACKENDS = frozenset({"auto", "coreml", "mps", "onnx", "tensorrt"})
 
 HAND_KEYPOINT_NAMES = (
     "wrist",
@@ -410,6 +422,58 @@ class TorchHandPoseBackend(HandPoseBackend):
         ) for landmarks in decoded]
 
 
+class OnnxHandPoseBackend(HandPoseBackend):
+    """Desktop / CPU path for the exported trt_pose_hand ONNX graph."""
+
+    name = "onnx"
+
+    def __init__(self, model_path: str | Path, *, threshold: float = 0.15) -> None:
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise RuntimeError("onnxruntime 未安装") from exc
+        path = Path(model_path)
+        if not path.is_file():
+            raise RuntimeError(f"ONNX 手势模型不存在: {path}")
+        available = list(ort.get_available_providers())
+        providers = [
+            name
+            for name in ("CUDAExecutionProvider", "CPUExecutionProvider")
+            if name in available
+        ] or available
+        self._session = ort.InferenceSession(str(path), providers=providers)
+        self._input_name = self._session.get_inputs()[0].name
+        self._output_names = [item.name for item in self._session.get_outputs()]
+        self._threshold = threshold
+
+    def infer(self, frame: np.ndarray) -> list[HandPoseResult]:
+        started = time.perf_counter()
+        outputs = self._session.run(None, {self._input_name: preprocess_frame(frame)})
+        named = {
+            name: value
+            for name, value in zip(self._output_names, outputs)
+        }
+        cmap = named.get("cmap")
+        paf = named.get("paf")
+        arrays = [np.asarray(value) for value in outputs]
+        if cmap is None:
+            cmap = next((value for value in arrays if 21 in value.shape), None)
+        if paf is None:
+            paf = next((value for value in arrays if 40 in value.shape), None)
+        if cmap is None:
+            raise RuntimeError("ONNX 输出中没有 21 通道 CMAP")
+        return [HandPoseResult(
+            landmarks,
+            confidence=float(np.mean([point.confidence for point in landmarks])),
+            backend=self.name,
+            latency_ms=(time.perf_counter() - started) * 1000.0,
+        ) for landmarks in decode_hand_poses(
+            np.asarray(cmap),
+            np.asarray(paf) if paf is not None else None,
+            self._threshold,
+        )]
+
+
 class TensorRTHandPoseBackend(HandPoseBackend):
     name = "tensorrt_fp16"
 
@@ -575,34 +639,134 @@ class Torch2TRTHandPoseBackend(HandPoseBackend):
         ) for landmarks in decoded]
 
 
-def create_hand_pose_backend(config: Any) -> HandPoseBackend:
-    requested = str(getattr(config, "gesture_backend", "auto") or "auto").lower()
-    system = platform.system()
-    if requested == "auto":
-        requested = "coreml" if system == "Darwin" else "tensorrt"
-    if requested == "coreml":
+def _download_file(url: str, dest: Path) -> None:
+    import httpx
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_name(dest.name + ".part")
+    timeout = httpx.Timeout(180.0, connect=20.0)
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        with client.stream("GET", url) as response:
+            response.raise_for_status()
+            with partial.open("wb") as handle:
+                for chunk in response.iter_bytes(64 * 1024):
+                    handle.write(chunk)
+    partial.replace(dest)
+
+
+def _install_onnx_from_archive(archive: Path, dest: Path) -> None:
+    with tarfile.open(archive, "r:*") as tar:
+        member = next(
+            (
+                item
+                for item in tar.getmembers()
+                if item.isfile() and Path(item.name).suffix.lower() == ".onnx"
+            ),
+            None,
+        )
+        if member is None:
+            raise RuntimeError("手势模型压缩包中没有 ONNX 文件")
+        source = tar.extractfile(member)
+        if source is None:
+            raise RuntimeError("无法读取手势 ONNX 模型")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        partial = dest.with_name(dest.name + ".tmp")
         try:
-            return CoreMLHandPoseBackend(
-                config.gesture_coreml_model_path,
-                threshold=config.gesture_keypoint_confidence,
-            )
-        except RuntimeError:
-            if system != "Darwin":
-                raise
-            return TorchHandPoseBackend(
-                config.gesture_torchscript_model_path,
-                threshold=config.gesture_keypoint_confidence,
-            )
-    if requested == "mps":
+            partial.write_bytes(source.read())
+            partial.replace(dest)
+        finally:
+            if partial.exists():
+                partial.unlink(missing_ok=True)
+
+
+def ensure_hand_pose_onnx_model(
+    model_path: str | Path,
+    *,
+    url: str = NVIDIA_HAND_POSE_ONNX_URL,
+) -> Path:
+    """Return the desktop ONNX weights, fetching the official archive if needed."""
+    dest = Path(model_path)
+    with _ONNX_MODEL_LOCK:
+        if dest.is_file() and dest.stat().st_size > 0:
+            return dest
+        archive = dest.parent / "Pose-ResNet18-Hand.tar.gz"
+        try:
+            if not archive.is_file() or archive.stat().st_size <= 0:
+                logger.info("正在下载桌面手势 ONNX 模型: %s", url)
+                _download_file(url, archive)
+            _install_onnx_from_archive(archive, dest)
+        except Exception as exc:
+            raise RuntimeError(
+                f"ONNX 手势模型不存在: {dest}。自动下载失败（{exc}）。"
+                "请运行 `uv run python scripts/download_hand_pose_model.py`"
+            ) from exc
+        if not dest.is_file() or dest.stat().st_size <= 0:
+            raise RuntimeError(f"ONNX 手势模型安装后仍不可用: {dest}")
+        logger.info("桌面手势 ONNX 模型就绪: %s", dest)
+        return dest
+
+
+def _is_jetson_target(config: Any) -> bool:
+    target = str(getattr(config, "target", "") or "").strip().lower()
+    if target == "jetson":
+        return True
+    machine = platform.machine().lower()
+    return platform.system() == "Linux" and machine in {"aarch64", "arm64"}
+
+
+def _keypoint_threshold(config: Any) -> float:
+    return float(getattr(config, "gesture_keypoint_confidence", 0.15))
+
+
+def _create_named_backend(name: str, config: Any) -> HandPoseBackend:
+    threshold = _keypoint_threshold(config)
+    if name == "coreml":
+        return CoreMLHandPoseBackend(
+            config.gesture_coreml_model_path,
+            threshold=threshold,
+        )
+    if name == "mps":
         return TorchHandPoseBackend(
             config.gesture_torchscript_model_path,
-            threshold=config.gesture_keypoint_confidence,
+            threshold=threshold,
         )
-    if requested == "tensorrt":
+    if name == "onnx":
+        path = ensure_hand_pose_onnx_model(
+            getattr(
+                config,
+                "gesture_onnx_model_path",
+                "models/hand_pose/hand_pose_resnet18.onnx",
+            )
+        )
+        return OnnxHandPoseBackend(path, threshold=threshold)
+    if name == "tensorrt":
         # Jetson production mode is strict: an incompatible/missing engine or
         # unavailable CUDA must surface to the Web UI, never fall back.
         return TensorRTHandPoseBackend(
             config.gesture_tensorrt_engine_path,
-            threshold=config.gesture_keypoint_confidence,
+            threshold=threshold,
         )
-    raise RuntimeError(f"未知手势推理后端: {requested}")
+    raise RuntimeError(f"未知手势推理后端: {name}")
+
+
+def _create_auto_backend(config: Any) -> HandPoseBackend:
+    if _is_jetson_target(config):
+        return _create_named_backend("tensorrt", config)
+    if platform.system() == "Darwin":
+        for name in ("coreml", "mps"):
+            try:
+                return _create_named_backend(name, config)
+            except RuntimeError:
+                logger.info("手势后端 %s 不可用，继续尝试桌面 ONNX", name)
+    return _create_named_backend("onnx", config)
+
+
+def create_hand_pose_backend(config: Any) -> HandPoseBackend:
+    requested = str(getattr(config, "gesture_backend", "auto") or "auto").lower()
+    backend = (
+        _create_auto_backend(config)
+        if requested == "auto"
+        else _create_named_backend(requested, config)
+    )
+    logger.info("手势推理后端: %s", backend.name)
+    return backend

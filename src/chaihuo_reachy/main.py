@@ -25,8 +25,14 @@ from chaihuo_reachy.dashboard import (
     run_websocket_session,
 )
 from chaihuo_reachy.engine import ConversationEngine
-from chaihuo_reachy.opening import OpeningAudio, load_opening_audio
-from chaihuo_reachy import daemon_runtime
+from chaihuo_reachy.opening import (
+    LOCAL_SHOWS,
+    LocalShowSpec,
+    OpeningAudio,
+    load_opening_audio,
+    load_training_faq_items,
+)
+from chaihuo_reachy import daemon_http, daemon_runtime
 from chaihuo_reachy.backends.interfaces import (
     playback_gain_from_percent,
     playback_percent_from_gain,
@@ -835,8 +841,210 @@ async def run_dashboard(
     gesture: Any | None = None
     gesture_session: dict[str, Any] = {"wake_word_enabled": None}
     motion_tasks: set[asyncio.Task[Any]] = set()
-    opening_task: asyncio.Task[None] | None = None
-    opening_active = False
+    show_task: asyncio.Task[None] | None = None
+    show_active = False
+    show_kind = ""
+    training_faq_items = load_training_faq_items()
+    robot_link = daemon_http.summarize_robot_link(None, sdk_status)
+    recorded_move_uuid: str | None = None
+    recorded_move_task: asyncio.Task[None] | None = None
+    robot_link_busy = False
+
+    def _show_fields() -> dict[str, Any]:
+        return {
+            "opening_active": show_active and show_kind == "opening",
+            "training_active": show_active and show_kind == "training",
+            "training_faq": training_faq_items,
+        }
+
+    def _compose_runtime() -> dict[str, Any]:
+        return {
+            **engine.runtime_status(),
+            **sdk_status,
+            **_show_fields(),
+            "robot_link": robot_link,
+        }
+
+    async def _refresh_robot_link() -> dict[str, Any]:
+        nonlocal robot_link
+        payload: dict[str, Any] | None = None
+        try:
+            host = _daemon_hosts(cfg)[0]
+            payload = await daemon_http.fetch_daemon_status(host, cfg.daemon_port)
+        except Exception:
+            payload = None
+        robot_link = daemon_http.summarize_robot_link(payload, sdk_status)
+        if robot_link_busy:
+            robot_link = {**robot_link, "busy": True}
+        return robot_link
+
+    def _daemon_move_target() -> tuple[str, int]:
+        return _daemon_hosts(cfg)[0], cfg.daemon_port
+
+    def _bind_robot_runtime(
+        new_reachy: Any,
+        new_motion: Any,
+        new_beat: Any,
+        new_status: dict[str, Any],
+    ) -> None:
+        nonlocal reachy, motion, beat_dance
+        reachy = new_reachy
+        motion = new_motion
+        beat_dance = new_beat
+        sdk_status.clear()
+        sdk_status.update(new_status)
+        engine._motion = motion
+        engine._beat_dance = beat_dance
+        if gesture is not None:
+            gesture._motion = motion
+
+    async def _connect_robot_link() -> None:
+        if reachy is not None and sdk_status.get("sdk_connected"):
+            woke = await _wake_up_reachy(reachy, attempts=1)
+            sdk_status["robot_ready"] = bool(woke)
+            sdk_status["robot_status"] = "ready" if woke else "degraded"
+            if not woke:
+                raise RuntimeError("daemon 已连接，但机器人未能站起")
+            return
+        (
+            new_reachy,
+            _new_audio,
+            _new_camera,
+            new_motion,
+            new_beat,
+            new_status,
+        ) = await _try_connect_daemon(cfg)
+        if new_reachy is None:
+            _bind_robot_runtime(None, None, None, new_status)
+            raise RuntimeError(str(new_status.get("daemon_error") or "连接失败"))
+        _bind_robot_runtime(new_reachy, new_motion, new_beat, new_status)
+
+    async def _disconnect_robot_link() -> None:
+        await _stop_recorded_move()
+        await _cancel_motion_tasks()
+        if engine._dance_loop_active:
+            await engine.stop_beat_dance()
+        current = reachy
+        if current is not None:
+            await _sleep_reachy_on_shutdown(current, cfg)
+            await _close_reachy_runtime(current)
+        _bind_robot_runtime(
+            None,
+            None,
+            None,
+            _degraded_sdk_status(cfg, "已关闭"),
+        )
+
+    async def _toggle_robot_link(connect: bool) -> None:
+        nonlocal robot_link_busy, robot_link
+        if robot_link_busy:
+            raise RuntimeError("正在切换连接")
+        robot_link_busy = True
+        robot_link = {
+            **robot_link,
+            "busy": True,
+            "label": "连接中" if connect else "关闭中",
+        }
+        broadcast({"type": "runtime_status", **_compose_runtime()})
+        try:
+            if connect:
+                await _connect_robot_link()
+            else:
+                await _disconnect_robot_link()
+        finally:
+            robot_link_busy = False
+            await _refresh_robot_link()
+            broadcast({"type": "runtime_status", **_compose_runtime()})
+
+    async def _watch_recorded_move(move_uuid: str) -> None:
+        nonlocal recorded_move_uuid
+        host, port = _daemon_move_target()
+        try:
+            for _ in range(180):
+                await asyncio.sleep(1)
+                if recorded_move_uuid != move_uuid:
+                    return
+                running = await daemon_http.list_running_moves(host, port)
+                if move_uuid not in running:
+                    break
+        except Exception:
+            logger.warning("查询 Reachy 动作播放状态失败", exc_info=True)
+        finally:
+            if recorded_move_uuid == move_uuid:
+                recorded_move_uuid = None
+                broadcast({"type": "reachy_move", "playing": False})
+
+    async def _stop_recorded_move() -> None:
+        nonlocal recorded_move_uuid, recorded_move_task
+        move_uuid = recorded_move_uuid
+        recorded_move_uuid = None
+        if recorded_move_task is not None and not recorded_move_task.done():
+            recorded_move_task.cancel()
+            await asyncio.gather(recorded_move_task, return_exceptions=True)
+        recorded_move_task = None
+        if move_uuid:
+            try:
+                host, port = _daemon_move_target()
+                await daemon_http.stop_recorded_move(host, port, move_uuid)
+            except daemon_http.DaemonHttpError:
+                logger.warning("停止 Reachy 官方动作失败", exc_info=True)
+        broadcast({"type": "reachy_move", "playing": False})
+
+    async def _handle_reachy_move(client: Any, data: dict[str, Any]) -> None:
+        nonlocal recorded_move_uuid, recorded_move_task
+        action = str(data.get("action") or "")
+        dataset = str(data.get("dataset") or "")
+        host, port = _daemon_move_target()
+        if action == "list":
+            try:
+                moves = await daemon_http.list_recorded_moves(host, port, dataset)
+            except Exception as exc:
+                await client.send_json(
+                    {
+                        "type": "reachy_move",
+                        "dataset": dataset,
+                        "moves": [],
+                        "error": f"读取动作库失败：{exc}",
+                    }
+                )
+                return
+            await client.send_json(
+                {"type": "reachy_move", "dataset": dataset, "moves": moves}
+            )
+            return
+        if action == "stop":
+            await _stop_recorded_move()
+            return
+        if action != "play":
+            await client.send_json(
+                {"type": "error", "message": "reachy_move action 必须为 list、play 或 stop"}
+            )
+            return
+        move = str(data.get("move") or "")
+        if not dataset or not move:
+            await client.send_json({"type": "error", "message": "请先选择动作库和动作"})
+            return
+        if engine._dance_loop_active or engine._bgm_active:
+            await client.send_json(
+                {"type": "error", "message": "正在播放音乐或舞蹈，请先停止再试官方动作"}
+            )
+            return
+        await _stop_recorded_move()
+        try:
+            move_uuid = await daemon_http.play_recorded_move(host, port, dataset, move)
+        except Exception as exc:
+            await client.send_json({"type": "error", "message": f"播放动作失败：{exc}"})
+            return
+        recorded_move_uuid = move_uuid
+        recorded_move_task = asyncio.create_task(_watch_recorded_move(move_uuid))
+        broadcast(
+            {
+                "type": "reachy_move",
+                "playing": True,
+                "dataset": dataset,
+                "move": move,
+            }
+        )
 
     def broadcast(msg: dict[str, Any]) -> None:
         hub.publish(msg)
@@ -861,12 +1069,12 @@ async def run_dashboard(
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _run_opening_show(audio: OpeningAudio) -> None:
-        nonlocal opening_active, opening_task
+    async def _run_opening_show(audio: OpeningAudio, spec: LocalShowSpec) -> None:
+        nonlocal show_active, show_kind, show_task
         gesture_task: asyncio.Task[None] | None = None
         previous_motion_gain: float | None = None
         try:
-            await engine.set_external_interaction(True, state="opening")
+            await engine.set_external_interaction(True, state=spec.kind)
             if motion is not None:
                 previous_motion_gain = motion.set_talk_motion_gain(
                     OPENING_TALK_MOTION_GAIN
@@ -875,16 +1083,19 @@ async def run_dashboard(
                     motion.opening_gesture(audio.duration_s)
                 )
             logger.info(
-                "🎙 播放本地开场白: %.1fs, %dHz", audio.duration_s, audio.sample_rate
+                "🎙 播放本地讲解（%s）: %.1fs, %dHz",
+                spec.label,
+                audio.duration_s,
+                audio.sample_rate,
             )
             await engine.play_local_speech(audio.pcm, audio.sample_rate)
-            broadcast({"type": "opening_status", "active": True, "state": "finished"})
+            broadcast({"type": spec.status, "active": True, "state": "finished"})
         except asyncio.CancelledError:
-            logger.info("🎙 开场白已手动停止")
+            logger.info("🎙 %s已手动停止", spec.label)
             raise
         except Exception as exc:
-            logger.exception("Opening show failed")
-            broadcast({"type": "error", "message": f"开场白播放失败：{exc}"})
+            logger.exception("Local show failed: %s", spec.kind)
+            broadcast({"type": "error", "message": f"{spec.label}播放失败：{exc}"})
         finally:
             if gesture_task is not None:
                 gesture_task.cancel()
@@ -895,14 +1106,15 @@ async def run_dashboard(
                 try:
                     await motion.reset_ready_pose(duration=1.0)
                 except Exception:
-                    logger.exception("开场结束姿态复位失败")
+                    logger.exception("讲解结束姿态复位失败")
                 finally:
                     if previous_motion_gain is not None:
                         motion.set_talk_motion_gain(previous_motion_gain)
             await engine.set_external_interaction(False)
-            opening_active = False
-            opening_task = None
-            broadcast({"type": "opening_status", "active": False, "state": "idle"})
+            show_active = False
+            show_kind = ""
+            show_task = None
+            broadcast({"type": spec.status, "active": False, "state": "idle"})
 
     engine.on_state_change(lambda s: broadcast({"type": "state", "state": s}))
     engine.on_transcript(
@@ -981,13 +1193,10 @@ async def run_dashboard(
     @app.websocket("/ws")
     async def ws_endpoint(ws: WebSocket) -> None:
         await ws.accept()
+        await _refresh_robot_link()
 
         def _snapshot() -> list[dict[str, Any]]:
-            runtime = {
-                **engine.runtime_status(),
-                **sdk_status,
-                "opening_active": opening_active,
-            }
+            runtime = _compose_runtime()
             return [
                 {"type": "state", "state": engine._state},
                 {
@@ -1001,7 +1210,15 @@ async def run_dashboard(
                     "type": "energy_listen",
                     "active": bool(runtime.get("energy_listen_active")),
                 },
-                {"type": "opening_status", "active": opening_active},
+                {
+                    "type": "opening_status",
+                    "active": show_active and show_kind == "opening",
+                },
+                {
+                    "type": "training_status",
+                    "active": show_active and show_kind == "training",
+                },
+                {"type": "training_faq", "items": training_faq_items},
                 {
                     "type": "bgm_status",
                     "active": engine._bgm_active,
@@ -1010,6 +1227,7 @@ async def run_dashboard(
                 },
                 {"type": "search", "enabled": cfg.search_policy != "off", "policy": cfg.search_policy},
                 {"type": "runtime_status", **runtime},
+                {"type": "reachy_move", "playing": recorded_move_uuid is not None},
                 gesture.status()
                 if gesture is not None
                 else {
@@ -1024,20 +1242,25 @@ async def run_dashboard(
             ]
 
         async def _handle_control(client: WebSocket, data: dict[str, Any]) -> None:
-            nonlocal opening_active, opening_task
+            nonlocal show_active, show_kind, show_task
             event_type = data.get("type", "")
-            if event_type == "opening_show":
+            show_spec = next(
+                (spec for spec in LOCAL_SHOWS.values() if spec.event == event_type),
+                None,
+            )
+            if show_spec is not None:
                 action = str(data.get("action") or "play")
                 if action == "stop":
-                    if opening_task is not None:
+                    if show_task is not None:
                         if engine._audio is not None:
                             engine._audio.stop_playback()
-                        opening_task.cancel()
-                        await asyncio.gather(opening_task, return_exceptions=True)
+                        show_task.cancel()
+                        await asyncio.gather(show_task, return_exceptions=True)
                     return
-                if opening_active:
+                if show_active:
+                    current = LOCAL_SHOWS.get(show_kind, show_spec)
                     await client.send_json(
-                        {"type": "error", "message": "开场白正在播放"}
+                        {"type": "error", "message": current.busy_message}
                     )
                     return
                 if motion is None:
@@ -1046,10 +1269,13 @@ async def run_dashboard(
                     )
                     return
                 try:
-                    audio = load_opening_audio()
+                    audio = load_opening_audio(show_spec.audio_path)
                 except Exception as exc:
                     await client.send_json(
-                        {"type": "error", "message": f"开场音频不可用：{exc}"}
+                        {
+                            "type": "error",
+                            "message": f"{show_spec.missing_message}：{exc}",
+                        }
                     )
                     return
                 if gesture is not None and gesture.active:
@@ -1059,25 +1285,29 @@ async def run_dashboard(
                     broadcast({"type": "wake_word", "enabled": bool(previous)})
                     broadcast(gesture.status())
                 await _cancel_motion_tasks()
-                opening_active = True
+                await _stop_recorded_move()
+                show_active = True
+                show_kind = show_spec.kind
                 broadcast(
                     {
-                        "type": "opening_status",
+                        "type": show_spec.status,
                         "active": True,
                         "state": "playing",
                         "duration_s": round(audio.duration_s, 1),
                     }
                 )
-                opening_task = asyncio.create_task(_run_opening_show(audio))
+                show_task = asyncio.create_task(_run_opening_show(audio, show_spec))
                 return
-            if opening_active and event_type not in {
+            if show_active and event_type not in {
                 "get_volume",
                 "set_volume",
                 "get_state",
                 "get_runtime_status",
             }:
+                current = LOCAL_SHOWS.get(show_kind)
+                label = current.label if current is not None else "讲解"
                 await client.send_json(
-                    {"type": "error", "message": "开场白演出中，其他交互已暂停"}
+                    {"type": "error", "message": f"{label}演出中，其他交互已暂停"}
                 )
                 return
             if event_type == "gesture_mode":
@@ -1092,6 +1322,7 @@ async def run_dashboard(
                         await client.send_json(gesture.status())
                         return
                     await _cancel_motion_tasks()
+                    await _stop_recorded_move()
                     gesture_session["wake_word_enabled"] = cfg.enable_wake_word
                     engine.set_wake_word_enabled(False)
                     await engine.set_external_interaction(True)
@@ -1184,14 +1415,8 @@ async def run_dashboard(
             elif event_type == "get_search":
                 await client.send_json({"type": "search", "enabled": cfg.search_policy != "off", "policy": cfg.search_policy})
             elif event_type == "get_runtime_status":
-                await client.send_json(
-                    {
-                        "type": "runtime_status",
-                        **engine.runtime_status(),
-                        **sdk_status,
-                        "opening_active": opening_active,
-                    }
-                )
+                await _refresh_robot_link()
+                await client.send_json({"type": "runtime_status", **_compose_runtime()})
             elif event_type == "get_gesture_status":
                 await client.send_json(gesture.status())
             elif event_type == "get_bgm":
@@ -1208,6 +1433,7 @@ async def run_dashboard(
                 if action == "stop":
                     message = await engine.stop_bgm()
                 else:
+                    await _stop_recorded_move()
                     message = await engine.start_bgm(str(data.get("track_id") or ""))
                 status = {
                     "type": "bgm_status",
@@ -1309,6 +1535,7 @@ async def run_dashboard(
                             }
                         )
                         return
+                    await _stop_recorded_move()
                     reply = await engine.start_beat_dance()
                     started = "开始跳舞" in reply
                     broadcast(
@@ -1338,20 +1565,67 @@ async def run_dashboard(
                     broadcast({"type": "motion_status", "action": "waving"})
                     _launch_motion(motion.wave_antenna("both"))
             elif event_type == "motion_pose":
-                if motion or reachy:
-                    action = data.get("action", "")
-                    if action == "sleep":
+                action = str(data.get("action") or "")
+                if action not in {"sleep", "wake_up"}:
+                    await client.send_json(
+                        {"type": "error", "message": "motion_pose action 必须为 wake_up 或 sleep"}
+                    )
+                    return
+                if not (motion or reachy):
+                    await client.send_json(
+                        {"type": "error", "message": "机器人未连接，无法切换电源"}
+                    )
+                    return
+                try:
+                    if action == "wake_up":
                         if reachy:
-                            reachy.goto_sleep()
-                        elif motion:
-                            _launch_motion(motion.sleep())
+                            woke = await _wake_up_reachy(reachy, attempts=1)
+                        else:
+                            assert motion is not None
+                            await motion.wake_up()
+                            woke = True
+                        sdk_status["robot_ready"] = bool(woke)
+                        sdk_status["robot_status"] = "ready" if woke else "degraded"
+                        broadcast({"type": "motion_status", "action": "ready" if woke else "error"})
+                    else:
+                        if reachy:
+                            await asyncio.to_thread(reachy.goto_sleep)
+                        else:
+                            assert motion is not None
+                            await motion.sleep()
+                        sdk_status["robot_ready"] = False
+                        sdk_status["robot_status"] = "sleeping"
                         broadcast({"type": "motion_status", "action": "sleeping"})
-                    elif action == "wake_up":
-                        if reachy:
-                            _launch_motion(_wake_up_reachy(reachy, attempts=1))
-                        elif motion:
-                            _launch_motion(motion.wake_up())
-                        broadcast({"type": "motion_status", "action": "ready"})
+                except Exception as exc:
+                    logger.exception("切换 Reachy 电源失败")
+                    await client.send_json(
+                        {"type": "error", "message": f"切换电源失败：{exc}"}
+                    )
+                    return
+                await _refresh_robot_link()
+                broadcast({"type": "runtime_status", **_compose_runtime()})
+            elif event_type == "reachy_link":
+                action = str(data.get("action") or "")
+                if action not in {"connect", "disconnect"}:
+                    await client.send_json(
+                        {
+                            "type": "error",
+                            "message": "reachy_link action 必须为 connect 或 disconnect",
+                        }
+                    )
+                    return
+                try:
+                    await _toggle_robot_link(action == "connect")
+                except Exception as exc:
+                    logger.exception("切换 Reachy 连接失败")
+                    await client.send_json(
+                        {
+                            "type": "error",
+                            "message": f"{'连接' if action == 'connect' else '关闭'}失败：{exc}",
+                        }
+                    )
+            elif event_type == "reachy_move":
+                await _handle_reachy_move(client, data)
 
         try:
             await run_websocket_session(ws, hub, _snapshot, _handle_control)
@@ -1369,17 +1643,17 @@ async def run_dashboard(
     @app.get("/")
     async def index() -> HTMLResponse:
         return HTMLResponse(
-            content=DASHBOARD_HTML,
+            content=Path(__file__).with_name("dashboard.html").read_text(encoding="utf-8"),
             headers={"Cache-Control": "no-store, max-age=0"},
         )
 
     @app.get("/status")
     async def status() -> JSONResponse:
         journal_health = engine._journal_fetcher.health()
+        await _refresh_robot_link()
         return JSONResponse(
             {
-                **engine.runtime_status(),
-                **sdk_status,
+                **_compose_runtime(),
                 "camera_device": str(cfg.camera_device),
                 "camera_stream": mjpeg.is_active,
                 "history_turns": len(engine._conversation_history) // 2,
@@ -1408,7 +1682,6 @@ async def run_dashboard(
                     else 0
                 ),
                 "wake_word_enabled": cfg.enable_wake_word,
-                "opening_active": opening_active,
                 "ws_subscribers": hub.subscriber_count,
             }
         )
@@ -1442,7 +1715,7 @@ async def run_dashboard(
                     else "unavailable"
                 ),
                 "state": engine._state,
-                "opening_active": opening_active,
+                **_show_fields(),
                 "model": runtime.get("model"),
                 "search_policy": runtime.get("search_policy"),
                 "search": runtime.get("search"),
@@ -1937,6 +2210,22 @@ def _clear_persisted_startup_app() -> None:
     set_startup_app(None)
 
 
+def _daemon_python_env() -> dict[str, str]:
+    """Give the SDK daemon the project venv, not a sourced ROS overlay.
+
+    Ubuntu PC shells commonly ``source /opt/ros/humble/setup.bash``. That
+    puts Humble's NumPy-1.x ``pinocchio`` on ``PYTHONPATH``. The SDK then
+    crashes with ``AttributeError: _ARRAY_API not found`` / SIGSEGV while
+    importing optional Placo kinematics, so motors never come up. The
+    daemon's default engine is AnalyticalKinematics and does not need
+    pinocchio.
+    """
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    return env
+
+
 def _spawn_sdk_daemon_process(cfg: Config, resolved_serial_port: str | None = None):
     """Start the SDK daemon and retain an owned process handle for cleanup.
 
@@ -1988,7 +2277,11 @@ def _spawn_sdk_daemon_process(cfg: Config, resolved_serial_port: str | None = No
         command.append("--sim")
     if cfg.media_backend == "no_media":
         command.append("--no-media")
-    process = subprocess.Popen(command, start_new_session=True)
+    process = subprocess.Popen(
+        command,
+        start_new_session=True,
+        env=_daemon_python_env(),
+    )
     logger.info("已启动无界面 SDK daemon: %s", " ".join(command))
     logger.info(
         "daemon 未请求 Control GUI；若仍出现窗口，请检查 macOS 登录项或外部 Reachy Tray App"
@@ -2114,16 +2407,13 @@ async def _daemon_backend_error(host: str, port: int, cfg: Config | None = None)
     an error state.  The status payload is therefore the authority for robot
     readiness, not merely a successful TCP/SDK connection.
     """
-    import httpx
-
     try:
-        async with httpx.AsyncClient(timeout=0.5) as client:
-            response = await client.get(f"http://{host}:{port}/api/daemon/status")
-        if response.status_code != 200:
-            return f"daemon 健康检查返回 HTTP {response.status_code}"
-        payload = response.json()
-        if not isinstance(payload, dict):
-            return "daemon 健康检查返回了无效数据"
+        payload = await daemon_http.fetch_daemon_status(host, port)
+    except daemon_http.DaemonHttpError as exc:
+        return str(exc)
+    except Exception:
+        return ""
+    try:
         state = str(payload.get("state") or "").lower()
         if state != "running":
             return str(payload.get("error") or "Reachy daemon backend failed")
@@ -2312,6 +2602,13 @@ async def _close_reachy_runtime(reachy: Any | None) -> None:
         daemon_process,
         state_file=getattr(reachy, "_chaihuo_daemon_state_file", None),
     )
+    client = getattr(reachy, "client", None)
+    disconnect = getattr(client, "disconnect", None)
+    if callable(disconnect):
+        try:
+            await asyncio.to_thread(disconnect)
+        except Exception:
+            logger.debug("SDK client 断开失败", exc_info=True)
     setattr(reachy, "_chaihuo_runtime_closed", True)
 
 
@@ -2621,6 +2918,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # Isolate this process the same way as the owned daemon: a sourced ROS
+    # workspace must not remain on PYTHONPATH after the interpreter starts.
+    os.environ.pop("PYTHONPATH", None)
+    os.environ.pop("PYTHONHOME", None)
+
     args = build_parser().parse_args()
 
     setup_logging(args.verbose)

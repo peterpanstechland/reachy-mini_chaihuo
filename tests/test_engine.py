@@ -187,17 +187,20 @@ async def test_standby_waits_for_local_voice_before_opening_cloud_asr() -> None:
     assert received == [[b"pre-roll-1", b"pre-roll-2", b"speech"]]
 
 
+def _pcm16(level: float, samples: int = 1600) -> bytes:
+    value = int(max(-1.0, min(1.0, level)) * 32767)
+    return struct.pack("<" + "h" * samples, *([value] * samples))
+
+
 @pytest.mark.asyncio
 async def test_energy_listen_bypasses_wake_word_and_uses_rms_threshold() -> None:
     class EnergyGateAudio:
         def __init__(self) -> None:
-            self.levels = iter([0.004] * 5 + [0.03, 0.03])
-            self.capture_rms = 0.0
-            self.chunks = [bytes([index, 0]) * 160 for index in range(7)]
+            self.capture_rms = 0.22
+            self.chunks = [_pcm16(0.004)] * 8 + [_pcm16(0.03), _pcm16(0.03)]
 
         async def start_capture(self):
             for chunk in self.chunks:
-                self.capture_rms = next(self.levels)
                 yield chunk
                 await asyncio.sleep(0)
 
@@ -222,8 +225,47 @@ async def test_energy_listen_bypasses_wake_word_and_uses_rms_threshold() -> None
 
     engine._listen_cloud_asr = fake_asr  # type: ignore[method-assign]
     assert await engine._listen_for_speech() == "直接说话测试"
-    assert received == [engine._audio.chunks[2:]]
+    assert received == [engine._audio.chunks[-5:]]
     assert engine._energy_listen_active is False
+
+
+@pytest.mark.asyncio
+async def test_energy_listen_ignores_capture_startup_spike() -> None:
+    class SpikedEnergyAudio:
+        def __init__(self) -> None:
+            self.capture_rms = 0.22
+            self.chunks = (
+                [_pcm16(0.22)] * 3
+                + [_pcm16(0.02)] * 5
+                + [_pcm16(0.03), _pcm16(0.03)]
+            )
+
+        async def start_capture(self):
+            for chunk in self.chunks:
+                yield chunk
+                await asyncio.sleep(0)
+
+    engine = ConversationEngine(
+        Config(
+            enable_wake_word=True,
+            wake_engine="local",
+            asr_initial_silence_timeout_s=0.2,
+            voice_activity_threshold=0.012,
+            vad_model_path="models/vad/not-installed.onnx",
+        ),
+        audio_backend=SpikedEnergyAudio(),  # type: ignore[arg-type]
+    )
+    engine._wake = object()
+    engine._energy_listen_requested = True
+    received: list[list[bytes]] = []
+
+    async def fake_asr(capture, initial_audio=None):
+        received.append(initial_audio or [])
+        return "尖峰后仍能开口"
+
+    engine._listen_cloud_asr = fake_asr  # type: ignore[method-assign]
+    assert await engine._listen_for_speech() == "尖峰后仍能开口"
+    assert received
 
 
 @pytest.mark.asyncio
@@ -1290,6 +1332,21 @@ async def test_chaihuo_introduction_uses_dedicated_official_knowledge() -> None:
     assert result["intent"] == "org_knowledge"
     assert "2011" in result["reply"]
     assert {source["type"] for source in result["sources"]} == {"organization"}
+
+
+@pytest.mark.asyncio
+async def test_wio_training_question_uses_workshop_faq() -> None:
+    class _TrainingEngine(ConversationEngine):
+        async def _think_text_only(self, messages, **kwargs):
+            prompt = messages[0]["content"]
+            assert "【Wio Terminal 培训FAQ】" in prompt
+            assert "Arduino IDE" in prompt
+            return "今天课分四步：认套件、连电脑、跑通示例，再自由做一个小作品。", ""
+
+    engine = _TrainingEngine(Config())
+    result = await engine.process_text("今天课程怎么走？")
+
+    assert "四步" in result["reply"]
 
 
 def test_conversation_defaults_are_twenty_turns_and_thirty_minutes() -> None:

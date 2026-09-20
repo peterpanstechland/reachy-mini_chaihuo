@@ -94,7 +94,7 @@ class GestureInteractionController:
             raise RuntimeError("机器人运动控制未就绪")
         if self._audio is None:
             raise RuntimeError("机器人音频输出未就绪")
-        if self._frames.get_bgr_frame() is None:
+        if await self._await_frame() is None:
             raise RuntimeError("Reachy 前置摄像头尚未提供可用 BGR 帧")
         self._backend = await asyncio.to_thread(self._backend_factory, self.config)
         self._selector.reset()
@@ -134,6 +134,16 @@ class GestureInteractionController:
         self._gesture = "OTHER"
         self._dance_style = ""
         self._publish(force=True)
+
+    async def _await_frame(self, timeout_s: float = 1.5) -> np.ndarray | None:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            frame = self._frames.get_bgr_frame()
+            if frame is not None:
+                return frame
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(0.05)
 
     async def _run(self) -> None:
         interval = 1.0 / max(1.0, float(self.config.gesture_inference_fps))

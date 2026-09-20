@@ -33,7 +33,7 @@ logger = logging.getLogger("chaihuo_reachy.audio")
 _REACHY_DEVICE_NAME = "reachy mini audio"
 
 
-def ensure_reachy_speaker_hardware_volume(percent: int = 90) -> bool:
+def ensure_reachy_speaker_hardware_volume(percent: int = 100) -> bool:
     """Force Reachy Mini ALSA speaker mixers to a known playback level.
 
     Dashboard / TTS gain only scale the PCM samples we write. The XMOS card
@@ -410,7 +410,7 @@ class DuplexAudioIO:
         if self._alsa or "reachy mini audio" in (
             f"{self.resolved_info.input_name} {self.resolved_info.output_name}".lower()
         ):
-            ensure_reachy_speaker_hardware_volume(90)
+            ensure_reachy_speaker_hardware_volume()
         self._alsa_stop = threading.Event()  # capture stop
         self._alsa_playback_stop = threading.Event()  # playback stop (dance music etc.)
         self._alsa_threads: list[threading.Thread] = []
@@ -421,6 +421,13 @@ class DuplexAudioIO:
         self._last_sample_at: float = 0.0
 
     # ── Capture ────────────────────────────────────────────────────────
+    def _alsa_capture_is_open(self) -> bool:
+        """True when the XMOS capture thread is still reading."""
+        return self._alsa and any(
+            t.name == "alsa-capture" and t.is_alive()
+            for t in getattr(self, "_alsa_threads", ())
+        )
+
     async def start_capture(self) -> AsyncIterator[bytes]:
         """Yield PCM int16 audio chunks from the microphone."""
         self._loop = asyncio.get_running_loop()
@@ -433,6 +440,12 @@ class DuplexAudioIO:
         except asyncio.CancelledError:
             pass
         finally:
+            # Leave the ALSA capture PCM running between listen turns.
+            # Closing hw:2,0 every wake-listen timeout (~60s) clicks the
+            # speaker even when the playback thread is reused.
+            if self._alsa_capture_is_open():
+                self._in_queue = None
+                return
             self._close_duplex()
 
     # ── Playback ───────────────────────────────────────────────────────
@@ -642,6 +655,8 @@ class DuplexAudioIO:
         conversation loop never dies on the backend choice.
         """
         if self._alsa:
+            if self._alsa_capture_is_open():
+                return
             try:
                 self._open_alsa_duplex()
                 return
@@ -764,6 +779,8 @@ class DuplexAudioIO:
         arecord --mmap on the XMOS card returns silence, so we deliberately
         use default (rw) access — verified to produce real mic audio.
         """
+        if self._alsa_capture_is_open():
+            return
         import alsaaudio  # type: ignore[import-not-found]
 
         name = getattr(self.resolved_info, "input_name", "") or ""
@@ -1056,8 +1073,11 @@ class DuplexAudioIO:
 
     def _safe_put(self, buf: bytes) -> None:
         """Thread-safe queue insertion from the audio callback."""
+        queue = self._in_queue
+        if queue is None:
+            return
         try:
-            self._in_queue.put_nowait(buf)
+            queue.put_nowait(buf)
         except asyncio.QueueFull:
             pass
 

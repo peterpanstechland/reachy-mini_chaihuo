@@ -11,7 +11,7 @@ import pytest
 from chaihuo_reachy.config import Config
 from chaihuo_reachy.engine import ConversationEngine
 from chaihuo_reachy.main import _MJPEGStream
-from chaihuo_reachy.camera import _avfoundation_video_devices, find_reachy_camera
+from chaihuo_reachy.camera import Camera, _avfoundation_video_devices, find_reachy_camera
 
 
 class FakeCamera:
@@ -39,6 +39,51 @@ class FakeVideoCamera(FakeCamera):
     def read(self) -> np.ndarray:
         self.capture_count += 1
         return np.full((1080, 1920, 3), self.capture_count % 255, dtype=np.uint8)
+
+
+def test_stale_video_node_recovers_via_auto_discovery(monkeypatch) -> None:
+    opened: list[str] = []
+
+    class _FakeCap:
+        def __init__(self, device, *args, **kwargs) -> None:
+            self.device = device
+            self._opened = True
+            opened.append(str(device))
+
+        def isOpened(self) -> bool:
+            return self._opened
+
+        def read(self):
+            if str(self.device) == "/dev/video3":
+                return True, np.zeros((16, 16, 3), dtype=np.uint8)
+            return False, None
+
+        def release(self) -> None:
+            self._opened = False
+
+        def set(self, *args, **kwargs) -> bool:
+            return True
+
+        def get(self, *args, **kwargs) -> float:
+            return 16.0
+
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        "chaihuo_reachy.camera.find_reachy_camera",
+        lambda value="auto": "/dev/video3" if value == "auto" else value,
+    )
+    monkeypatch.setattr(cv2, "VideoCapture", _FakeCap)
+
+    camera = Camera(device="/dev/video2")
+    assert camera.open()
+    frame = None
+    for _ in range(5):
+        frame = camera.capture_frame()
+        if frame is not None:
+            break
+    assert frame is not None
+    assert camera._device == "/dev/video3"
+    assert "/dev/video3" in opened
 
 
 def test_macos_camera_resolution_never_falls_back_to_an_index(monkeypatch) -> None:

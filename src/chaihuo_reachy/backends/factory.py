@@ -18,7 +18,7 @@ def _normalize_reachy_speaker_volume() -> None:
     try:
         from chaihuo_reachy.audio import ensure_reachy_speaker_hardware_volume
 
-        ensure_reachy_speaker_hardware_volume(90)
+        ensure_reachy_speaker_hardware_volume()
     except Exception as exc:  # pragma: no cover - best-effort hardware init
         logger.warning("Reachy speaker hardware volume init failed: %s", exc)
 

@@ -8,6 +8,11 @@ if [[ ! -x .venv/bin/chaihuo-reachy ]]; then
   exit 1
 fi
 
+# ROS setup.bash injects Humble pinocchio (NumPy 1.x). This project pins
+# NumPy 2.2; importing that overlay crashes reachy-mini-daemon and leaves
+# the robot in standalone mode with motors disabled.
+unset PYTHONPATH PYTHONHOME
+
 # USB / in-car: pick the Reachy Mini XMOS by name. Device indexes change
 # after replug, so never keep REACHY_AUDIO_DEVICE=default or a stale number.
 resolve_reachy_serial_port() {
@@ -36,14 +41,8 @@ if [[ -n "${REACHY_SERIAL_PORT}" ]]; then
   export REACHY_AUDIO_DEVICE="${REACHY_AUDIO_DEVICE_OVERRIDE:-auto}"
   export REACHY_AUDIO_INPUT_CHANNEL="${REACHY_AUDIO_INPUT_CHANNEL_OVERRIDE:-1}"
   export REACHY_CAMERA_DEVICE="${REACHY_CAMERA_DEVICE_OVERRIDE:-auto}"
-  # PCM,0 is the stereo speaker path. PCM,1 is a joined mono control and
-  # raising it alone leaves the actual output around -23 dB.
-  if amixer -c Audio sget 'PCM',0 >/dev/null 2>&1; then
-    amixer -q -c Audio sset 'PCM',0 90%
-  fi
-  if amixer -c Audio sget 'PCM',1 >/dev/null 2>&1; then
-    amixer -q -c Audio sset 'PCM',1 90%
-  fi
+  # PCM,0 is the stereo speaker path. PCM,1 alone can leave output at -23 dB.
+  .venv/bin/python -c 'from chaihuo_reachy.audio import ensure_reachy_speaker_hardware_volume; ensure_reachy_speaker_hardware_volume()'
   echo "Reachy Mini detected at ${REACHY_SERIAL_PORT}; using robot USB camera/mic/speaker."
   args=(dashboard --target mac)
 else

@@ -100,6 +100,31 @@ _LIVE_LOCATION_RE = re.compile(
     r"(?:我们|咱们|基地车)(?:在|到|走到)?哪(?:里|儿)?|"
     r"(?:我们|咱们|基地车)?(?:到|走到)哪(?:里|儿)?(?:了|啦))"
 )
+_TRAINING_TERMS = (
+    "wio",
+    "wio terminal",
+    "grove",
+    "seeed",
+    "希德",
+    "培训",
+    "上手课",
+    "编程课",
+)
+
+
+def is_training_query(text: str) -> bool:
+    """Whether this turn should use the Wio Terminal workshop FAQ."""
+    normalized = (text or "").casefold()
+    if any(term in normalized for term in _TRAINING_TERMS):
+        return True
+    cleaned = " ".join((text or "").split())
+    if not cleaned:
+        return False
+    from chaihuo_reachy.opening import load_training_faq_items
+
+    return any(cleaned == item["question"] for item in load_training_faq_items())
+
+
 _ORG_TERMS = (
     "柴火创客",
     "柴火空间",

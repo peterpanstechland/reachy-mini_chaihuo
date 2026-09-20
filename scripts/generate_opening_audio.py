@@ -16,11 +16,11 @@ from chaihuo_reachy.config import load_config
 from chaihuo_reachy.opening import (
     DEFAULT_OPENING_AUDIO_PATH,
     DEFAULT_OPENING_TEXT_PATH,
+    parse_opening_script,
+    resolve_dialect_voice,
 )
 
-DIALECT_MARKER = "\n\n[天津话]\n"
 DIALECT_MODEL = "qwen3-tts-flash"
-DIALECT_VOICE = "Peter"
 
 
 async def synthesize_segment(text: str, config) -> tuple[np.ndarray, int]:
@@ -59,21 +59,20 @@ async def generate(text_path: Path, output_path: Path) -> None:
     config.tts_volume = 100
     config.tts_speech_rate = 0.96
 
-    if DIALECT_MARKER in text:
-        main_text, dialect_text = text.split(DIALECT_MARKER, 1)
-    else:
-        main_text, dialect_text = text, ""
+    script = parse_opening_script(text)
 
-    main_samples, sample_rate = await synthesize_segment(main_text.strip(), config)
+    main_samples, sample_rate = await synthesize_segment(script.body, config)
     segments = [main_samples]
-    if dialect_text.strip():
+    if script.dialect_text:
+        dialect_voice = resolve_dialect_voice(script.dialect_label)
+        print(f"dialect={script.dialect_label} voice={dialect_voice}")
         dialect_config = replace(
             config,
             bailian_tts_model=DIALECT_MODEL,
-            bailian_tts_voice=DIALECT_VOICE,
+            bailian_tts_voice=dialect_voice,
         )
         dialect_samples, dialect_rate = await synthesize_segment(
-            dialect_text.strip(), dialect_config
+            script.dialect_text, dialect_config
         )
         silence = np.zeros(round(sample_rate * 0.35), dtype=np.float32)
         segments.extend(

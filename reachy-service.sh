@@ -117,15 +117,8 @@ start_service() {
     fi
 
     printf '🚀 正在启动皮皮虾服务...\n'
-    # PCM,0 is the stereo speaker path. PCM,1 alone can leave output around -23 dB.
-    if command -v amixer >/dev/null 2>&1; then
-        if amixer -c Audio sget 'PCM',0 >/dev/null 2>&1; then
-            amixer -q -c Audio sset 'PCM',0 90% || true
-        fi
-        if amixer -c Audio sget 'PCM',1 >/dev/null 2>&1; then
-            amixer -q -c Audio sset 'PCM',1 90% || true
-        fi
-    fi
+    # PCM,0 is the stereo speaker path. PCM,1 alone can leave output at -23 dB.
+    "${PYTHON}" -c 'from chaihuo_reachy.audio import ensure_reachy_speaker_hardware_volume; ensure_reachy_speaker_hardware_volume()' || true
     printf '\n[%s] service start\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "${LOG_FILE}"
     (
         cd "${PROJECT_DIR}" || exit 1

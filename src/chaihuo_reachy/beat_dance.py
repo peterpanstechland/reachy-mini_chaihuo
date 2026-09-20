@@ -25,8 +25,9 @@ from typing import Any
 
 import numpy as np
 
+from chaihuo_reachy.bgm import clean_track_title
 from chaihuo_reachy.config import Config
-from chaihuo_reachy.music import load_audio
+from chaihuo_reachy.music import detect_bpm, load_audio
 
 logger = logging.getLogger("chaihuo_reachy.beat_dance")
 
@@ -141,6 +142,54 @@ def _load_timeline(path: Path) -> dict:
         for i, b in enumerate(beats):
             b["energy_bucket"] = buckets[i] if i < len(buckets) else "MID"
     return tl
+
+
+def _timeline_from_audio(music_path: Path) -> dict | None:
+    """Build the beat-dance JSON from a track using existing BPM detection.
+
+    ``data/`` is not shipped in git, so first deploy has music but no
+    ``dadongbei_timeline.json``.  Reuse ``load_audio`` / ``detect_bpm`` and
+    the same energy-bucket math the authored timeline uses.
+    """
+    info = load_audio(music_path)
+    if info is None:
+        return None
+    sr, pcm = info
+    samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+    if samples.size == 0:
+        return None
+    duration = float(samples.size / sr)
+    tempo = detect_bpm(pcm, sr) or 120.0
+    interval = 60.0 / tempo if tempo > 0 else 0.5
+    beats: list[dict[str, Any]] = []
+    rms_values: list[float] = []
+    t = 0.0
+    while t < duration:
+        start = int(t * sr)
+        end = int(min((t + interval) * sr, samples.size))
+        if end <= start:
+            break
+        window = samples[start:end]
+        rms = float(np.sqrt(np.mean(np.square(window))))
+        beats.append({"time": round(t, 4), "rms": rms})
+        rms_values.append(rms)
+        t += interval
+    if not beats:
+        return None
+    peak = float(np.percentile(np.asarray(rms_values, dtype=np.float32), 95))
+    peak = max(peak, 1e-6)
+    for beat, rms in zip(beats, rms_values):
+        norm = min(1.0, rms / peak)
+        beat["rms"] = round(norm, 4)
+        beat["strength"] = round(norm, 4)
+    for beat, bucket in zip(beats, _compute_smooth_energy_buckets(beats)):
+        beat["energy_bucket"] = bucket
+    return {
+        "track_title": clean_track_title(music_path),
+        "tempo": float(tempo),
+        "duration": round(duration, 3),
+        "beats": beats,
+    }
 
 
 def _energy_bucket_for_beat(beat: dict) -> str:
@@ -472,13 +521,26 @@ class BeatDanceController:
         if self._timeline is not None:
             return True
         if not self._timeline_path.is_file():
-            logger.warning("[beat-dance] timeline 缺失: %s", self._timeline_path)
-            return False
-        try:
-            self._timeline = _load_timeline(self._timeline_path)
-        except Exception:
-            logger.warning("[beat-dance] timeline 解析失败", exc_info=True)
-            return False
+            generated = _timeline_from_audio(self._music_path)
+            if generated is None:
+                logger.warning("[beat-dance] timeline 缺失: %s", self._timeline_path)
+                return False
+            try:
+                self._timeline_path.parent.mkdir(parents=True, exist_ok=True)
+                self._timeline_path.write_text(
+                    json.dumps(generated, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                logger.info("[beat-dance] 已从音频生成 timeline: %s", self._timeline_path)
+            except OSError:
+                logger.warning("[beat-dance] timeline 无法写入，仅本次使用", exc_info=True)
+                self._timeline = generated
+        if self._timeline is None:
+            try:
+                self._timeline = _load_timeline(self._timeline_path)
+            except Exception:
+                logger.warning("[beat-dance] timeline 解析失败", exc_info=True)
+                return False
         self._beats = self._timeline.get("beats", [])
         self._beat_times = np.array([b["time"] for b in self._beats])
         self._timeline_duration = float(self._timeline.get("duration") or 0.0)

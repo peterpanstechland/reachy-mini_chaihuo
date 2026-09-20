@@ -20,6 +20,9 @@ state/
 # ── Models ──────────────────────────────────────────────────────
 models/
 
+# ── Local runtime libs (e.g. PortAudio when apt is unavailable) ─
+.local-libs/
+
 # ── Generated / source media not required for deployment ───────
 bgm/*.mgg*.flac
 bgm/*.mflac*.flac

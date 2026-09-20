@@ -286,6 +286,18 @@ def find_reachy_camera(config_value: int | str = "auto") -> int | str:
     return 0
 
 
+def v4l2_open_candidates(device: int | str) -> list[int | str]:
+    """Return the sysfs path first, then the numeric index OpenCV 5 accepts."""
+    candidates: list[int | str] = [device]
+    if isinstance(device, str):
+        name = Path(device).name
+        if name.startswith("video") and name[5:].isdigit():
+            index = int(name[5:])
+            if index != device:
+                candidates.append(index)
+    return candidates
+
+
 class Camera:
     """Capture still frames from Reachy Mini's USB camera.
 
@@ -310,6 +322,9 @@ class Camera:
         self._ffmpeg: subprocess.Popen[bytes] | None = None
         self._ffmpeg_buffer = bytearray()
         self._prefetched_jpeg: bytes | None = None
+        self._recover_lock = threading.Lock()
+        self._last_recover_at = 0.0
+        self._read_failures = 0
 
     def open(self) -> bool:
         """Open the camera. Returns True on success."""
@@ -321,13 +336,16 @@ class Camera:
             return self._open_named_avfoundation()
 
         if platform.system() == "Linux":
-            self._cap = cv2.VideoCapture(self._device, cv2.CAP_V4L2)
+            if not self._open_v4l2():
+                logger.error("Cannot open camera device: %s", self._device)
+                return False
         else:
             self._cap = cv2.VideoCapture(self._device)
-        if not self._cap.isOpened():
-            logger.error("Cannot open camera device: %s", self._device)
-            self._cap = None
-            return False
+            if not self._cap.isOpened():
+                logger.error("Cannot open camera device: %s", self._device)
+                self._cap = None
+                return False
+        assert self._cap is not None
 
         if platform.system() == "Linux":
             self._cap.set(
@@ -359,6 +377,29 @@ class Camera:
             actual_fourcc,
         )
         return True
+
+    def _open_v4l2(self) -> bool:
+        """Open the Reachy node, falling back to the numeric V4L2 index.
+
+        OpenCV 5 can refuse ``/dev/videoN`` as a capture name even when the
+        node is valid. The sysfs path is still the stable identity; index is
+        only the open handle.
+        """
+        for device in v4l2_open_candidates(self._device):
+            cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
+            if cap.isOpened():
+                if device != self._device:
+                    logger.info(
+                        "V4L2 无法按路径打开 %s，改用索引 %s",
+                        self._device,
+                        device,
+                    )
+                    self._device = device
+                self._cap = cap
+                return True
+            cap.release()
+        self._cap = None
+        return False
 
     def _open_named_avfoundation(self) -> bool:
         """Resolve the exact Reachy name, then open its current AVFoundation index."""
@@ -432,33 +473,70 @@ class Camera:
             self._prefetched_jpeg = None
             logger.info("Named AVFoundation camera closed")
 
+    def _device_missing(self) -> bool:
+        return (
+            isinstance(self._device, str)
+            and self._device.startswith("/dev/")
+            and not Path(self._device).exists()
+        )
+
+    def _recover(self) -> bool:
+        """Re-resolve the Reachy node after USB re-enumeration."""
+        now = time.monotonic()
+        with self._recover_lock:
+            if now - self._last_recover_at < 1.5:
+                return False
+            self._last_recover_at = now
+            previous = self._device
+            if self._cap is not None:
+                self._cap.release()
+                self._cap = None
+            try:
+                self._device = find_reachy_camera("auto")
+            except RuntimeError as exc:
+                logger.warning("Camera recover: %s", exc)
+                return False
+            logger.warning("Camera recovering: %s → %s", previous, self._device)
+            if not self.open():
+                return False
+            self._read_failures = 0
+            return True
+
+    def _read_bgr(self) -> np.ndarray | None:
+        if self._cap is None or not self._cap.isOpened() or self._device_missing():
+            if not self._recover():
+                return None
+        assert self._cap is not None
+        ret, frame = self._cap.read()
+        if ret and frame is not None:
+            self._read_failures = 0
+            return frame
+        self._read_failures += 1
+        if self._read_failures >= 3 or self._device_missing():
+            if self._recover() and self._cap is not None:
+                ret, frame = self._cap.read()
+                if ret and frame is not None:
+                    self._read_failures = 0
+                    return frame
+        return None
+
     def capture_jpeg(self, quality: int = 85) -> bytes | None:
         """Capture a single frame and encode as JPEG.
 
         Returns:
             JPEG bytes, or None if capture failed.
         """
-        if self._cap is None:
-            if self._ffmpeg is None:
-                logger.warning("Camera not open — call open() first")
-                return None
+        if self._cap is None and self._ffmpeg is not None:
             if self._prefetched_jpeg is not None:
                 frame = self._prefetched_jpeg
                 self._prefetched_jpeg = None
                 return frame
             return self._read_ffmpeg_jpeg()
 
-        # Re-open if needed (some cameras drop after long idle)
-        if not self._cap.isOpened():
-            logger.warning("Camera disconnected — reopening")
-            self._cap.open(self._device)
-
-        ret, frame = self._cap.read()
-        if not ret or frame is None:
-            logger.warning("Failed to capture frame")
+        frame = self._read_bgr()
+        if frame is None:
             return None
 
-        # Encode as JPEG
         success, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
         if not success:
             return None
@@ -473,10 +551,7 @@ class Camera:
                 return None
             array = np.frombuffer(jpeg, dtype=np.uint8)
             return cv2.imdecode(array, cv2.IMREAD_COLOR)
-        if self._cap is None or not self._cap.isOpened():
-            return None
-        ret, frame = self._cap.read()
-        return frame if ret else None
+        return self._read_bgr()
 
     @property
     def is_open(self) -> bool:

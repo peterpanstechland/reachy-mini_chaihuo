@@ -43,13 +43,18 @@ from chaihuo_reachy.bgm import (
 )
 from chaihuo_reachy.camera import visual_quality_issue
 from chaihuo_reachy.config import Config
-from chaihuo_reachy.audio_frontend import DirectionGate, SpeechEndpoint
+from chaihuo_reachy.audio_frontend import (
+    DirectionGate,
+    SpeechEndpoint,
+    adaptive_energy_threshold,
+)
 from chaihuo_reachy.intent import (
     IntentDecision,
     TurnIntent,
     classify_intent,
     extract_location_update,
     is_journey_overview_query,
+    is_training_query,
 )
 from chaihuo_reachy.location import LocationService, create_location_service
 from chaihuo_reachy.memory import JournalFetcher
@@ -1037,6 +1042,7 @@ class ConversationEngine:
         legacy_voice_frames = 0
         energy_noise_samples: list[float] = []
         energy_trigger_threshold = self.config.voice_activity_threshold
+        energy_noise_needed = 8 if energy_only else 0
         self._emit_asr_status(
             "免唤醒聆听中，请直接说话"
             if energy_only
@@ -1061,14 +1067,14 @@ class ConversationEngine:
                 pre_roll.append(chunk)
                 frame = frontend.update(chunk)
                 backend_rms = float(getattr(self._audio, "capture_rms", 0.0) or 0.0)
-                if energy_only and len(energy_noise_samples) < 5:
-                    energy_noise_samples.append(backend_rms)
-                    if len(energy_noise_samples) == 5:
-                        noise_floor = float(np.median(energy_noise_samples))
-                        energy_trigger_threshold = max(
-                            self.config.voice_activity_threshold,
-                            noise_floor * 2.5,
-                            0.012,
+                if energy_only and len(energy_noise_samples) < energy_noise_needed:
+                    energy_noise_samples.append(frame.rms)
+                    if len(energy_noise_samples) == energy_noise_needed:
+                        noise_floor, energy_trigger_threshold = (
+                            adaptive_energy_threshold(
+                                energy_noise_samples,
+                                self.config.voice_activity_threshold,
+                            )
                         )
                         logger.info(
                             "🎤 [免唤醒] 底噪 RMS=%.4f，触发阈值 RMS=%.4f",
@@ -1076,7 +1082,9 @@ class ConversationEngine:
                             energy_trigger_threshold,
                         )
                     continue
-                energy_ready = backend_rms >= energy_trigger_threshold
+                energy_ready = (
+                    frame.rms if energy_only else backend_rms
+                ) >= energy_trigger_threshold
                 if energy_ready and (
                     energy_only
                     or not self.config.audio_frontend_v2
@@ -1592,6 +1600,7 @@ class ConversationEngine:
         vision_context = ""
         location_context = self._session_location_context()
         organization_context = ""
+        training_context = self.config.training_faq() if is_training_query(text) else ""
         reply = ""
         emotion = ""
         error: str | None = None
@@ -1746,6 +1755,12 @@ class ConversationEngine:
                     system_prompt += (
                         f"\n\n【柴火创客官方知识】\n{organization_context}\n"
                         "回答组织介绍时可以展开；不得把这些背景冒充成具体旅途经历。"
+                    )
+                if training_context:
+                    system_prompt += (
+                        f"\n\n【Wio Terminal 培训FAQ】\n{training_context}\n"
+                        "只根据以上问答解释今天的培训安排和设备使用；"
+                        "FAQ没写的政策或能否带走套件，请让用户问现场工作人员。"
                     )
                 if vision_context:
                     system_prompt += f"\n\n【本轮视觉观察】\n{vision_context}"
@@ -3426,6 +3441,8 @@ class ConversationEngine:
             return "节拍连跳未启用（缺少 beat 控制器）"
         if self._dance_loop_active:
             return "已经在跳啦"
+        if self._bgm_active:
+            await self.stop_bgm(resume_conversation=False)
         await self._suspend_voice_for_dance()
         info = self._beat_dance.start()
         if info is None:

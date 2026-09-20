@@ -53,7 +53,7 @@ class SdkAudioIO:
 
         # Keep hardware speaker gain consistent even when the process is
         # started without start-pc.sh (for example via reachy-service.sh).
-        ensure_reachy_speaker_hardware_volume(90)
+        ensure_reachy_speaker_hardware_volume()
         self._volume = MAX_PLAYBACK_GAIN  # Dashboard 100% at startup
         self._play_rms = 0.0
         self._playback_observer: Callable[[bytes, int], None] | None = None

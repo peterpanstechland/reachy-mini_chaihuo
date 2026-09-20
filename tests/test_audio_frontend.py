@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from chaihuo_reachy.audio_frontend import (
     DirectionGate,
     SpeechEndpoint,
+    adaptive_energy_threshold,
     circular_distance_deg,
     pcm16_rms,
 )
@@ -16,6 +18,21 @@ def _pcm(level: float, samples: int = 1600) -> bytes:
 
 def test_pcm16_rms_is_true_root_mean_square() -> None:
     assert abs(pcm16_rms(_pcm(0.25)) - 0.25) < 0.001
+
+
+def test_adaptive_energy_threshold_ignores_startup_spike() -> None:
+    floor, threshold = adaptive_energy_threshold(
+        [0.22, 0.18, 0.16, 0.02, 0.019, 0.021, 0.018, 0.02],
+        0.012,
+    )
+    assert floor == pytest.approx(0.019, abs=0.003)
+    assert threshold == pytest.approx(0.012)
+
+
+def test_adaptive_energy_threshold_tracks_stable_ambient() -> None:
+    floor, threshold = adaptive_energy_threshold([0.02] * 8, 0.012)
+    assert floor == pytest.approx(0.02)
+    assert threshold == pytest.approx(0.05)
 
 
 def test_circular_angle_distance_wraps_at_zero() -> None:

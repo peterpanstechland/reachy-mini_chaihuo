@@ -391,7 +391,12 @@ class MotionController:
                     for antennas, body_yaw in OPENING_GESTURE_SEQUENCE:
                         if time.monotonic() - started >= max(0.0, duration_s - 1.0):
                             break
+                        # Always pin the head. goto_target(head=None) captures
+                        # the present pose, which already includes speech
+                        # offsets, then speech is composed again — the head
+                        # walks downward over a long opening.
                         await self._safe_goto(
+                            head=HEAD_NEUTRAL,
                             antennas=antennas,
                             body_yaw=body_yaw,
                             duration=0.9,
@@ -399,6 +404,7 @@ class MotionController:
                         await asyncio.sleep(1.8)
             finally:
                 await self._safe_goto(
+                    head=HEAD_NEUTRAL,
                     antennas=ANTENNA_NEUTRAL,
                     body_yaw=0.0,
                     duration=0.8,

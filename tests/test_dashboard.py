@@ -108,11 +108,16 @@ def test_browser_uses_page_host_and_normalized_chat_protocol() -> None:
     assert 'id="wakeBtn"' in DASHBOARD_HTML
     assert 'id="energyListenBtn"' in DASHBOARD_HTML
     assert 'id="openingBtn"' in DASHBOARD_HTML
+    assert 'id="trainingBtn"' in DASHBOARD_HTML
+    assert 'id="trainingFaq"' in DASHBOARD_HTML
     assert 'id="volumeRange"' in DASHBOARD_HTML
     assert 'type:"get_wake_word"' in DASHBOARD_HTML
     assert 'type:"set_wake_word"' in DASHBOARD_HTML
     assert 'type:"energy_listen"' in DASHBOARD_HTML
     assert 'type:"opening_show"' in DASHBOARD_HTML
+    assert 'type:"training_show"' in DASHBOARD_HTML
+    assert "Wio Terminal 常见问题" in DASHBOARD_HTML
+    assert "renderTrainingFaq" in DASHBOARD_HTML
     assert 'type:"get_volume"' in DASHBOARD_HTML
     assert 'type:"set_volume"' in DASHBOARD_HTML
     # Opening the HTML file directly must not issue file:// API requests.
@@ -136,6 +141,29 @@ def test_browser_uses_page_host_and_normalized_chat_protocol() -> None:
     assert 'type:"get_bgm"' in DASHBOARD_HTML
     assert 'type:"bgm_control"' in DASHBOARD_HTML
     assert "播放音乐" in DASHBOARD_HTML
+    assert 'id="reachyCard"' in DASHBOARD_HTML
+    assert 'id="reachyPower"' in DASHBOARD_HTML
+    assert 'id="movePlayBtn"' in DASHBOARD_HTML
+    assert 'type:"reachy_link"' in DASHBOARD_HTML
+    assert 'action:on?"connect":"disconnect"' in DASHBOARD_HTML
+    assert 'type:"reachy_move"' in DASHBOARD_HTML
+    assert "robotLink(m.robot_link)" in DASHBOARD_HTML
+    assert 'id="gesturePreview"' in DASHBOARD_HTML
+    assert 'id="gesturePreviewCamera"' in DASHBOARD_HTML
+    assert 'id="gesturePreviewOverlay"' in DASHBOARD_HTML
+    assert "setGesturePreview(gestureActive" in DASHBOARD_HTML
+    assert 'cam.src="/camera/stream"' in DASHBOARD_HTML
+
+
+def test_dashboard_embeds_daemon_link_controls() -> None:
+    source = inspect.getsource(run_dashboard)
+    assert "daemon_http.fetch_daemon_status" in source
+    assert "_refresh_robot_link" in source
+    assert "event_type == \"reachy_move\"" in source
+    assert "event_type == \"reachy_link\"" in source
+    assert "await _try_connect_daemon(cfg)" in source
+    assert "await _close_reachy_runtime(current)" in source
+    assert "await _stop_recorded_move()" in source
 
 
 def test_opening_show_respects_live_dashboard_volume() -> None:
@@ -145,10 +173,13 @@ def test_opening_show_respects_live_dashboard_volume() -> None:
     opening_source = source[opening_start:opening_end]
     assert "engine._audio.volume =" not in opening_source
 
-    opening_gate_start = source.index("if opening_active and event_type not in")
+    opening_gate_start = source.index("if show_active and event_type not in")
     opening_gate_end = source.index("if event_type == \"gesture_mode\"", opening_gate_start)
     opening_gate_source = source[opening_gate_start:opening_gate_end]
     assert '"set_volume"' in opening_gate_source
+    assert '"motion_pose"' not in opening_gate_source
+    assert '"reachy_link"' not in opening_gate_source
+    assert '"reachy_move"' not in opening_gate_source
 
 
 def test_chat_store_replays_both_sides_sources_and_capture() -> None:

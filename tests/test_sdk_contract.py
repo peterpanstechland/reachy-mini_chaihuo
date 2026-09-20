@@ -175,6 +175,22 @@ async def test_owned_daemon_shutdown_lets_daemon_sleep_then_stops_process() -> N
 
 
 @pytest.mark.asyncio
+async def test_close_runtime_disconnects_sdk_client() -> None:
+    from chaihuo_reachy import main as main_module
+
+    events: list[str] = []
+    reachy = SimpleNamespace(
+        client=SimpleNamespace(disconnect=lambda: events.append("disconnect")),
+        media_manager=None,
+        _chaihuo_daemon_process=None,
+    )
+    await main_module._close_reachy_runtime(reachy)
+    assert events == ["disconnect"]
+    await main_module._close_reachy_runtime(reachy)
+    assert events == ["disconnect"]
+
+
+@pytest.mark.asyncio
 async def test_concurrent_external_shutdown_requests_send_one_sleep_command() -> None:
     from chaihuo_reachy import main as main_module
     from chaihuo_reachy.config import Config

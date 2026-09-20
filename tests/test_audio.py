@@ -112,6 +112,32 @@ def test_alsa_full_close_releases_playback_pcm() -> None:
     assert pcm.closed  # else the XMOS device stays busy for the next launch
 
 
+@pytest.mark.asyncio
+async def test_alsa_listen_turn_keeps_capture_pcm_open() -> None:
+    import asyncio
+
+    from chaihuo_reachy.audio import DuplexAudioIO
+
+    audio = object.__new__(DuplexAudioIO)
+    audio._alsa = True
+    audio._alsa_threads = [
+        types.SimpleNamespace(name="alsa-capture", is_alive=lambda: True)
+    ]
+    closed: list[object] = []
+    audio._open_duplex = lambda: None  # type: ignore[method-assign]
+    audio._close_duplex = lambda *args, **kwargs: closed.append(True)  # type: ignore[method-assign]
+
+    agen = audio.start_capture()
+    pending = asyncio.create_task(anext(agen))
+    await asyncio.sleep(0)
+    await audio._in_queue.put(b"chunk")
+    assert await pending == b"chunk"
+    await agen.aclose()
+    assert closed == []
+    assert audio._in_queue is None
+    assert audio._alsa_capture_is_open()
+
+
 def test_alsa_capture_teardown_keeps_playback_pcm() -> None:
     audio, pcm = _make_alsa_io()
     audio._close_duplex(keep_playback=True)  # end of a listen turn

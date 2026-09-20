@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,6 +22,33 @@ def pcm16_rms(pcm: bytes) -> float:
         return 0.0
     x = samples.astype(np.float32) / 32768.0
     return float(np.sqrt(np.mean(np.square(x), dtype=np.float64)))
+
+
+def adaptive_energy_threshold(
+    noise_samples: Sequence[float],
+    configured: float,
+    *,
+    multiplier: float = 2.5,
+    floor: float = 0.012,
+    max_factor: float = 6.0,
+) -> tuple[float, float]:
+    """Derive a one-shot energy gate from a short ambient window.
+
+    Capture startup and speaker bleed can spike the first few RMS values.
+    Those transients must not lock the listen threshold above real speech.
+    """
+    configured = max(float(configured), 0.0)
+    floor = max(float(floor), 0.0)
+    base = max(configured, floor)
+    if not noise_samples:
+        return 0.0, base
+    values = np.asarray(list(noise_samples), dtype=np.float64)
+    noise_floor = float(np.percentile(values, 20))
+    spread = float(np.percentile(values, 80))
+    if spread > max(noise_floor * 4.0, base * 8.0):
+        return noise_floor, base
+    raw = max(base, noise_floor * float(multiplier))
+    return noise_floor, min(raw, base * float(max_factor))
 
 
 def circular_distance_deg(a: float, b: float) -> float:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 import time
 
@@ -165,7 +166,25 @@ async def test_reset_ready_pose_clears_offsets_and_restores_neutral() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_opening_gesture_pins_head_neutral() -> None:
+    reachy = _FlakyReachy(fail_first=0)
+    motion = MotionController(reachy)  # type: ignore[arg-type]
+    await motion.opening_gesture(0.2)
+
+    assert reachy.goto_targets
+    for target in reachy.goto_targets:
+        assert target["head"].tolist() == [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+
+
 def test_opening_motion_limits_and_gain_are_restrained() -> None:
+    source = inspect.getsource(MotionController.opening_gesture)
+    assert source.count("head=HEAD_NEUTRAL") >= 2
     assert OPENING_TALK_MOTION_GAIN == pytest.approx(0.35)
     assert max(
         abs(angle)

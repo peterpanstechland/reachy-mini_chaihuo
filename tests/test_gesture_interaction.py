@@ -139,3 +139,54 @@ async def test_debounce_single_trigger_preemption_and_lost_timeout(tmp_path: Pat
     await controller._handle_pose(result(partial), 3.5)
     assert controller.state == "LOST"
     assert motion.neutral_count == 1
+
+
+class DelayedFrames:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def get_bgr_frame(self):
+        self.calls += 1
+        if self.calls < 3:
+            return None
+        return np.zeros((224, 224, 3), dtype=np.uint8)
+
+
+class FakeBackend:
+    name = "fake"
+
+    def infer(self, frame):
+        return []
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_start_waits_for_first_camera_frame() -> None:
+    config = SimpleNamespace(
+        gesture_keypoint_confidence=.15,
+        gesture_confirmation_ms=300,
+        gesture_lost_timeout_ms=800,
+        gesture_tracking_alpha=.35,
+        gesture_tracking_deadzone=.06,
+        gesture_head_yaw_max_deg=20,
+        gesture_head_pitch_max_deg=20,
+        gesture_body_yaw_max_deg=30,
+        gesture_tracking_max_step_deg=2,
+        gesture_inference_fps=15,
+        dance_music_dir=".",
+    )
+    frames = DelayedFrames()
+    controller = GestureInteractionController(
+        config,
+        frame_source=frames,
+        motion=Motion(),
+        audio=Audio(),
+        backend_factory=lambda _config: FakeBackend(),
+        pose_factory=lambda **_: np.eye(4),
+    )
+    status = await controller.start()
+    assert status["active"] is True
+    assert frames.calls >= 3
+    await controller.stop()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from chaihuo_reachy.intent import TurnIntent, classify_intent
+from chaihuo_reachy.intent import TurnIntent, classify_intent, is_training_query
 
 
 @pytest.mark.parametrize(
@@ -55,3 +55,21 @@ from chaihuo_reachy.intent import TurnIntent, classify_intent
 )
 def test_critical_intent_routes(text: str, expected: TurnIntent) -> None:
     assert classify_intent(text).intent == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Wio Terminal 是什么？",
+        "今天课程怎么走？",
+        "Grove 模块怎么接？",
+        "培训怎么开始",
+    ],
+)
+def test_training_questions_use_workshop_faq(text: str) -> None:
+    assert is_training_query(text)
+
+
+def test_unrelated_questions_skip_workshop_faq() -> None:
+    assert not is_training_query("基地车去过哪里")
+    assert not is_training_query("")

@@ -167,9 +167,10 @@ class Config:
     camera_height: int = 480
 
     # ── Single-hand pose interaction ──────────────────────────────────
-    gesture_backend: str = "auto"  # auto | coreml | mps | tensorrt
+    gesture_backend: str = "auto"  # auto | coreml | mps | onnx | tensorrt
     gesture_coreml_model_path: str = "models/hand_pose/hand_pose_resnet18.mlpackage"
     gesture_torchscript_model_path: str = "models/hand_pose/hand_pose_resnet18.ts"
+    gesture_onnx_model_path: str = "models/hand_pose/hand_pose_resnet18.onnx"
     gesture_tensorrt_engine_path: str = "models/hand_pose/hand_pose_resnet18_fp16.engine"
     gesture_torch2trt_model_path: str = "models/hand_pose/hand_pose_resnet18_torch2trt.pth"
     gesture_inference_fps: float = 15.0
@@ -263,6 +264,12 @@ class Config:
         """Load curated, source-labelled Chaihuo organization facts."""
         p = self.profile_dir / "organization_knowledge.txt"
         return p.read_text(encoding="utf-8").strip() if p.exists() else ""
+
+    def training_faq(self) -> str:
+        """Load the Wio Terminal workshop FAQ used by speech and Dashboard."""
+        from chaihuo_reachy.opening import load_training_faq_text
+
+        return load_training_faq_text()
 
     def system_prompt_with_context(
         self, journal_context: str = "", vision_context: str = ""
@@ -371,6 +378,7 @@ _ENV: dict[str, str] = {
     "gesture_backend": "REACHY_GESTURE_BACKEND",
     "gesture_coreml_model_path": "REACHY_GESTURE_COREML_MODEL",
     "gesture_torchscript_model_path": "REACHY_GESTURE_TORCHSCRIPT_MODEL",
+    "gesture_onnx_model_path": "REACHY_GESTURE_ONNX_MODEL",
     "gesture_tensorrt_engine_path": "REACHY_GESTURE_TENSORRT_ENGINE",
     "gesture_torch2trt_model_path": "REACHY_GESTURE_TORCH2TRT_MODEL",
     "gesture_inference_fps": "REACHY_GESTURE_INFERENCE_FPS",
@@ -462,8 +470,10 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     cfg.visual_context_ttl_s = max(0.0, float(cfg.visual_context_ttl_s))
     cfg.vision_max_calls_per_turn = max(1, int(cfg.vision_max_calls_per_turn))
 
+    from chaihuo_reachy.hand_pose import GESTURE_BACKENDS
+
     cfg.gesture_backend = str(cfg.gesture_backend or "auto").strip().lower()
-    if cfg.gesture_backend not in {"auto", "coreml", "mps", "tensorrt"}:
+    if cfg.gesture_backend not in GESTURE_BACKENDS:
         logger.warning("未知手势推理后端 %r，回退为 auto", cfg.gesture_backend)
         cfg.gesture_backend = "auto"
     cfg.gesture_inference_fps = max(1.0, float(cfg.gesture_inference_fps))
