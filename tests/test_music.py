@@ -9,7 +9,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from chaihuo_reachy.music import detect_bpm, load_audio, read_track, resolve_track
+from chaihuo_reachy.music import (
+    AmbientBeatTracker,
+    detect_bpm,
+    load_audio,
+    read_track,
+    resolve_track,
+)
 
 
 def _make_wav(path: Path, sr: int = 16000, seconds: float = 1.0) -> None:
@@ -81,6 +87,50 @@ def test_load_audio_wav_and_missing(tmp_path) -> None:
     assert sr == 16000
     assert len(pcm) == 3200
     assert load_audio(tmp_path / "missing.wav") is None
+
+
+def test_ambient_tracker_locks_click_tempo() -> None:
+    sr = 16000
+    tracker = AmbientBeatTracker(sample_rate=sr, window_s=6.0)
+    pcm = _beat_pulse_pcm(sr, 120.0, seconds=6.0)
+    tracker.push(pcm, now=10.0)
+    assert tracker.bpm == pytest.approx(120.0, abs=3)
+    beat, beat_time = tracker.beat_for_elapsed(1.0, origin=9.0)
+    assert 0.25 <= beat["strength"] <= 1.0
+    assert beat_time >= 0.0
+
+
+def _rising_pulse_pcm(sr: int, bpm: float, seconds: float) -> bytes:
+    n = int(sr * seconds)
+    x = np.zeros(n, dtype=np.int16)
+    step = int(sr * 60.0 / bpm)
+    width = int(sr * 0.05)
+    for t in range(0, n, step):
+        amp = int(1500 + 11000 * (t / max(n - 1, 1)))
+        x[t : t + width] = amp
+    return x.tobytes()
+
+
+def test_ambient_tracker_flags_rising_energy() -> None:
+    sr = 16000
+    tracker = AmbientBeatTracker(sample_rate=sr, window_s=6.0)
+    tracker.push(_rising_pulse_pcm(sr, 120.0, 6.0), now=10.0)
+    assert tracker.buildup >= 0.35
+    beat, _ = tracker.beat_for_elapsed(1.0, origin=9.0)
+    assert beat["buildup"] >= 0.35
+
+
+def test_ambient_tracker_flat_track_is_not_buildup() -> None:
+    tracker = AmbientBeatTracker(sample_rate=16000)
+    tracker.push(_beat_pulse_pcm(16000, 120.0, 6.0), now=10.0)
+    assert tracker.buildup < 0.35
+
+
+def test_ambient_tracker_needs_enough_audio() -> None:
+    tracker = AmbientBeatTracker(sample_rate=16000)
+    tracker.push(b"\x00\x00" * 1600, now=1.0)
+    assert tracker.bpm == 120.0
+    assert tracker.rms == 0.0
 
 
 def test_load_audio_mp3_falls_back_to_wav(tmp_path) -> None:

@@ -133,9 +133,12 @@ def test_browser_uses_page_host_and_normalized_chat_protocol() -> None:
     assert "navigator.geolocation.watchPosition" in DASHBOARD_HTML
     assert 'type:"browser_location"' in DASHBOARD_HTML
     assert 'id="beatDanceBtn"' in DASHBOARD_HTML
+    assert 'id="ambientDanceBtn"' in DASHBOARD_HTML
     assert "大东北我的家乡" in DASHBOARD_HTML
     assert 'type:"motion_dance_loop"' in DASHBOARD_HTML
-    assert "setBeatDanceState(!!m.dance_loop_active" in DASHBOARD_HTML
+    assert 'type:"ambient_dance"' in DASHBOARD_HTML
+    assert "setDanceLoopFromRuntime" in DASHBOARD_HTML
+    assert "跟着音乐" in DASHBOARD_HTML
     assert 'id="bgmSelect"' in DASHBOARD_HTML
     assert 'id="bgmBtn"' in DASHBOARD_HTML
     assert 'type:"get_bgm"' in DASHBOARD_HTML
@@ -180,6 +183,8 @@ def test_dashboard_embeds_daemon_link_controls() -> None:
     assert 'event_type == "show_content"' in source
     assert "handle_show_content_action" in source
     assert "show_content_busy" in source
+    assert 'event_type == "ambient_dance"' in source
+    assert "start_ambient_dance" in source
 
 
 def test_opening_show_respects_live_dashboard_volume() -> None:

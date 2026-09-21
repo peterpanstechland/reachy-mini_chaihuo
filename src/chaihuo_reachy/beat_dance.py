@@ -27,7 +27,7 @@ import numpy as np
 
 from chaihuo_reachy.bgm import clean_track_title
 from chaihuo_reachy.config import Config
-from chaihuo_reachy.music import detect_bpm, load_audio
+from chaihuo_reachy.music import AmbientBeatTracker, detect_bpm, load_audio
 
 logger = logging.getLogger("chaihuo_reachy.beat_dance")
 
@@ -240,15 +240,19 @@ class BeatSyncOscillator:
 # 每桶动作签名不同：FADE 慢摆 / LOW 弹跳 / MID 律动 / TILT 侧倾 / PEAK 全身大开
 # body_base 大幅提高（底盘摆动是律动感核心），PEAK 顶满 BODY_SOFT_CAP
 BUCKET_PARAMS: dict[str, tuple[float, float, float, float, float, float, float]] = {
-    "FADE": (0.5, 12,  8,  6, 22, 16,  2),
-    "LOW":  (0.8, 14, 10,  8, 23, 19,  3),
-    "MID":  (1.5, 14, 12, 10, 20, 22,  4),
-    "TILT": (1.5, 12, 12, 14, 18, 26,  5),
-    "PEAK": (2.0, 16, 14, 16, 18, 30,  6),
+    "FADE": (0.5, 12,  8,  6, 22, 16, 10),
+    "LOW":  (0.8, 14, 10,  8, 23, 19, 12),
+    "MID":  (1.5, 14, 12, 10, 20, 22, 14),
+    "TILT": (1.5, 12, 12, 14, 18, 26, 15),
+    "PEAK": (2.0, 16, 14, 16, 18, 30, 16),
 }
 
 BUCKET_AMP_TARGET: dict[str, float] = {
     "FADE": 0.85, "LOW": 0.9, "MID": 0.95, "TILT": 1.0, "PEAK": 1.25,
+}
+
+BUCKET_RISE_LEVEL: dict[str, float] = {
+    "FADE": 0.12, "LOW": 0.32, "MID": 0.55, "TILT": 0.78, "PEAK": 1.0,
 }
 
 # 4 拍一组的动作重心（yaw, pitch, roll 权重）—— 避免一直摇头晃天线
@@ -305,6 +309,9 @@ class BeatMotionSynthesizer:
         self.cur_osc_freq = 0.5
         self.target_scale = 0.0
         self.loop_count = 0
+        self.rise_level = 1.0
+        self._in_buildup = False
+        self._last_synth_elapsed = 0.0
 
     # ── Lifecycle ─────────────────────────────────────────────────────
     def on_run_start(self) -> None:
@@ -313,6 +320,9 @@ class BeatMotionSynthesizer:
         self._crossfade.active = False
         self._prev_amplitude_scale = self.amplitude_scale
         self.smooth_strength = 0.3
+        self.rise_level = 1.0
+        self._in_buildup = False
+        self._last_synth_elapsed = 0.0
 
     def on_loop_restart(self) -> None:
         self.loop_count += 1
@@ -343,6 +353,36 @@ class BeatMotionSynthesizer:
             return 1.0
         return 0.5 - 0.5 * math.cos(math.pi * raw)
 
+    def _update_buildup_rise(
+        self, elapsed: float, beat: dict[str, Any], energy_bucket: str
+    ) -> None:
+        """Buildup: dip low, then rise over ~8 beats. Otherwise follow energy."""
+        level = max(
+            BUCKET_RISE_LEVEL.get(energy_bucket, 0.55),
+            float(beat.get("strength") or 0.0) * 0.9,
+        )
+        climb = float(beat["buildup"]) if "buildup" in beat else 0.0
+        is_buildup = climb >= 0.35 or energy_bucket == "TILT"
+        if is_buildup and not self._in_buildup:
+            self._in_buildup = True
+            self.rise_level = min(self.rise_level, 0.12)
+        elif not is_buildup:
+            self._in_buildup = False
+        dt = max(0.0, elapsed - self._last_synth_elapsed)
+        self._last_synth_elapsed = elapsed
+        target = 1.0 if self._in_buildup else level
+        if self._in_buildup:
+            tau = 8.0 * self._beat_interval
+        elif target > self.rise_level:
+            tau = 1.6 * self._beat_interval
+        else:
+            tau = 2.2 * self._beat_interval
+        if dt > 0 and tau > 0:
+            self.rise_level += (target - self.rise_level) * (
+                1.0 - math.exp(-dt / tau)
+            )
+        self.rise_level = _clamp(self.rise_level, 0.0, 1.0)
+
     def synthesize(
         self, elapsed: float, beat: dict[str, Any], beat_time: float
     ) -> tuple[Any, np.ndarray, float, dict[str, float]]:
@@ -360,6 +400,8 @@ class BeatMotionSynthesizer:
         section_label = BUCKET_SECTION_LABEL.get(energy_bucket, "normal")
         params = BUCKET_PARAMS.get(energy_bucket, BUCKET_PARAMS["MID"])
         (osc_freq, yaw_base, pitch_base, roll_base, ant_base, body_base, z_amp) = params
+        self._update_buildup_rise(elapsed, beat, energy_bucket)
+        h = self.rise_level
 
         # Song-specific motif first; generic timelines keep the 4-beat rotation.
         group = int(beat_time / self._beat_interval) % len(GROUP_MOTIFS) \
@@ -428,7 +470,7 @@ class BeatMotionSynthesizer:
             body_raw = self._crossfade.from_body + (body_raw - self._crossfade.from_body) * ease
 
         amp_mult = self.amplitude_scale * (0.45 + 0.30 * self.smooth_strength)
-        amp_mult = _clamp(amp_mult, 0.65, 1.8)  # 整体幅度上限提高，高潮更猛
+        amp_mult = _clamp(amp_mult * (0.55 + 0.45 * h), 0.45, 1.8)
 
         # 4-beat motif weights make the leading DOF vary over time
         yaw_deg_raw = yaw_raw * yaw_base * amp_mult * w_yaw
@@ -448,7 +490,19 @@ class BeatMotionSynthesizer:
         ant_l_deg_raw += sub_sin * ant_base
         ant_r_deg_raw -= sub_sin * ant_base
 
-        pulse = self.smooth_strength * math.exp(-4.0 * beat_phase)
+        # 对拍跳跃：先微蹲再弹起。Reachy Mini 不能离桌，Stewart 的 z + 点头就是可见的跳。
+        # buildup 时 rise_level 从低到高：蹲着小跳 → 抬头大跳。
+        crouch = max(0.0, 1.0 - beat_phase / 0.14)
+        hop = math.sin(math.pi * _clamp(beat_phase / 0.40, 0.0, 1.0))
+        hop_scale = 0.22 + 0.78 * h
+        pulse = hop * (0.55 + 0.45 * self.smooth_strength)
+        pitch_deg_raw += (
+            (-6.5 + 13.0 * h)
+            + hop * 5.0 * self.smooth_strength * hop_scale
+            - crouch * 3.5
+        )
+        ant_l_deg_raw += hop * 8.0 * self.smooth_strength * hop_scale
+        ant_r_deg_raw += hop * 8.0 * self.smooth_strength * hop_scale
 
         yaw_deg = _clamp(yaw_deg_raw, -YAW_SOFT_CAP, YAW_SOFT_CAP)
         pitch_deg = _clamp(pitch_deg_raw, -18.0, 22.0)
@@ -456,12 +510,18 @@ class BeatMotionSynthesizer:
         ant_l_deg = _clamp(ant_l_deg_raw, -ANT_SOFT_CAP, ANT_SOFT_CAP)
         ant_r_deg = _clamp(ant_r_deg_raw, -ANT_SOFT_CAP, ANT_SOFT_CAP)
         body_deg = _clamp(body_deg_raw, -BODY_SOFT_CAP, BODY_SOFT_CAP)
-        z_mm = pulse * z_amp
+        z_mm = _clamp(
+            (-7.0 + 12.0 * h)
+            + pulse * z_amp * hop_scale
+            - crouch * min(6.0, z_amp * 0.45) * (1.0 - 0.4 * h),
+            -8.0,
+            16.0,
+        )
 
         from reachy_mini.utils import create_head_pose
 
         pose = create_head_pose(
-            z=_clamp(z_mm, -8.0, 16.0),
+            z=z_mm,
             roll=_clamp(roll_deg, -18.0, 18.0),
             pitch=pitch_deg,
             yaw=yaw_deg,
@@ -479,6 +539,7 @@ class BeatMotionSynthesizer:
             "right_antenna_deg": ant_r_deg,
             "body_yaw_deg": body_deg,
             "z_mm": z_mm,
+            "rise_level": h,
             "mode_label": f"{section_label} / {energy_bucket}",
             "motif": motif or f"group-{group + 1}",
         }
@@ -515,6 +576,8 @@ class BeatDanceController:
                                         "loop_count": 0, "uptime_s": 0.0}
         self._synthesizer: BeatMotionSynthesizer | None = None
         self._sent_errors = 0
+        self._ambient = False
+        self._tracker: AmbientBeatTracker | None = None
 
     # ── Public API ────────────────────────────────────────────────────
     def load_timeline(self) -> bool:
@@ -577,6 +640,8 @@ class BeatDanceController:
         if info is None:
             logger.warning("[beat-dance] 音乐不可用: %s", self._music_path)
             return None
+        self._ambient = False
+        self._tracker = None
         self._stop_event.clear()
         self._loop_count = 0
         self._loop_origin = time.monotonic()
@@ -590,6 +655,7 @@ class BeatDanceController:
         with self._status_lock:
             self._status["active"] = True
             self._status["track_title"] = self._track_title
+            self._status["source"] = "file"
             self._status["loop_count"] = 0
         logger.info(
             "[beat-dance] 开始歌曲舞蹈: %s (%.1f BPM)",
@@ -598,13 +664,45 @@ class BeatDanceController:
         )
         return info
 
+    def start_ambient(self, tracker: AmbientBeatTracker) -> bool:
+        """Dance to live mic beats. No local file is played."""
+        if self.is_active:
+            return False
+        self._ambient = True
+        self._tracker = tracker
+        self._track_title = "现场音乐"
+        self._tempo = tracker.bpm
+        self._beat_interval = 60.0 / self._tempo if self._tempo > 0 else 0.5
+        self._timeline_duration = 0.0
+        self._stop_event.clear()
+        self._loop_count = 0
+        self._loop_origin = time.monotonic()
+        self._loop_started_at = self._loop_origin
+        self._synthesizer = BeatMotionSynthesizer(self._beat_interval)
+        self._synthesizer.on_run_start()
+        self._thread = threading.Thread(
+            target=self._ambient_control_loop, name="ambient-dance", daemon=True
+        )
+        self._thread.start()
+        with self._status_lock:
+            self._status["active"] = True
+            self._status["track_title"] = self._track_title
+            self._status["source"] = "ambient"
+            self._status["tempo"] = self._tempo
+            self._status["loop_count"] = 0
+        logger.info("[beat-dance] 开始听歌跳舞 (%.1f BPM)", self._tempo)
+        return True
+
     def stop(self) -> None:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+        self._ambient = False
+        self._tracker = None
         with self._status_lock:
             self._status["active"] = False
+            self._status["source"] = ""
         self._move_to_neutral()
         logger.info("[beat-dance] 停止，回中立")
 
@@ -674,6 +772,41 @@ class BeatDanceController:
 
             self._stop_event.wait(CONTROL_PERIOD_S)
 
+        with self._status_lock:
+            self._status["active"] = False
+            self._status["mode_label"] = "Finished"
+
+    def _ambient_control_loop(self) -> None:
+        assert self._synthesizer is not None
+        synth = self._synthesizer
+        tracker = self._tracker
+        if tracker is None:
+            return
+        while not self._stop_event.is_set():
+            now = time.monotonic()
+            elapsed = now - self._loop_origin
+            beat, beat_time = tracker.beat_for_elapsed(elapsed, self._loop_origin)
+            # 现场麦 RMS 远小于文件归一化能量，沿用同一套桶表时先用 strength。
+            strength = float(beat.get("strength") or 0.5)
+            beat = {**beat, "strength": strength, "rms": strength}
+            tempo = tracker.bpm
+            interval = 60.0 / tempo if tempo > 0 else 0.5
+            synth._beat_interval = interval
+            try:
+                pose, antennas, body_yaw_rad, status = synth.synthesize(
+                    elapsed, beat, beat_time
+                )
+                self._send_target(pose, antennas, body_yaw_rad)
+                with self._status_lock:
+                    self._status.update(status)
+                    self._status["elapsed"] = elapsed
+                    self._status["tempo"] = tempo
+                    self._status["source"] = "ambient"
+                    self._status["track_title"] = self._track_title
+                    self._status["uptime_s"] = now - self._loop_started_at
+            except Exception:
+                logger.debug("[beat-dance] 现场节拍合成失败", exc_info=True)
+            self._stop_event.wait(CONTROL_PERIOD_S)
         with self._status_lock:
             self._status["active"] = False
             self._status["mode_label"] = "Finished"

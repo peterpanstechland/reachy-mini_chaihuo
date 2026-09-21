@@ -1623,6 +1623,44 @@ async def run_dashboard(
                 elif action == "stop":
                     await engine.stop_beat_dance()
                     broadcast({"type": "dance_loop", "active": False})
+            elif event_type == "ambient_dance":
+                action = str(data.get("action") or "play")
+                if action == "stop":
+                    await engine.stop_beat_dance()
+                    broadcast(
+                        {
+                            "type": "dance_loop",
+                            "active": False,
+                            "source": "",
+                        }
+                    )
+                elif getattr(engine, "_dance_loop_active", False):
+                    return
+                elif beat_dance is None:
+                    await client.send_json(
+                        {"type": "error", "message": "节拍连跳未启用"}
+                    )
+                elif motion is not None and motion.is_busy:
+                    await client.send_json(
+                        {
+                            "type": "error",
+                            "message": "机器人正在执行其他动作，请稍后",
+                        }
+                    )
+                else:
+                    await _stop_recorded_move()
+                    reply = await engine.start_ambient_dance()
+                    started = "听外面的音乐" in reply or "对上拍" in reply
+                    broadcast(
+                        {
+                            "type": "dance_loop",
+                            "active": started,
+                            "source": "ambient" if started else "",
+                            "track_title": "现场音乐",
+                        }
+                    )
+                    if reply and not started:
+                        await client.send_json({"type": "error", "message": reply})
             elif event_type == "motion_nod":
                 if motion:
                     broadcast({"type": "motion_status", "action": "nodding"})

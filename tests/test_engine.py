@@ -663,12 +663,16 @@ async def test_referential_followup_reuses_short_lived_visual_observation() -> N
 
 class _MusicFakeAudio:
     backend_name = "fake"
+    is_playing = False
 
     def __init__(self) -> None:
         self.plays: list[bytes] = []
+        self.chunks: list[bytes] = []
         self.output_sr: int | None = None
+        self.input_sr = 16000
         self.capture_rms = 0.0
         self.stopped = False
+        self.resolved_info: dict[str, object] = {}
 
     def set_output_sample_rate(self, sr: int) -> None:
         self.output_sr = sr
@@ -678,6 +682,13 @@ class _MusicFakeAudio:
 
     def stop_playback(self) -> None:
         self.stopped = True
+
+    async def start_capture(self):
+        while True:
+            await asyncio.sleep(0.02)
+            chunk = b"\x00\x00" * 320
+            self.chunks.append(chunk)
+            yield chunk
 
 
 @pytest.mark.asyncio
@@ -927,19 +938,40 @@ class _FakeBeatDance:
 
     def __init__(self) -> None:
         self.started = 0
+        self.ambient_started = 0
         self.stopped = 0
         self._pcm = b"\x00\x00" * 1600  # 0.1s of silence @16k
         self.track_title = "测试歌曲"
+        self.is_active = False
+        self.tracker = None
 
     def start(self):
         self.started += 1
+        self.is_active = True
         return (16000, self._pcm)
+
+    def start_ambient(self, tracker) -> bool:
+        if self.is_active:
+            return False
+        self.ambient_started += 1
+        self.tracker = tracker
+        self.track_title = "现场音乐"
+        self.is_active = True
+        return True
 
     def stop(self) -> None:
         self.stopped += 1
+        self.is_active = False
 
     def status(self) -> dict:
-        return {"active": True, "elapsed": 1.0, "mode_label": "MID", "loop_count": 1}
+        return {
+            "active": self.is_active,
+            "elapsed": 1.0,
+            "mode_label": "MID",
+            "loop_count": 1,
+            "source": "ambient" if self.ambient_started and self.is_active else "file",
+            "tempo": 120.0,
+        }
 
 
 @pytest.mark.asyncio
@@ -995,6 +1027,60 @@ async def test_start_stop_beat_dance() -> None:
     assert not engine._dance_loop_active
     assert beat.stopped == 1
     assert audio.stopped  # playback buffer cleared
+
+
+@pytest.mark.asyncio
+async def test_start_stop_ambient_dance() -> None:
+    audio = _MusicFakeAudio()
+    beat = _FakeBeatDance()
+    engine = ConversationEngine(
+        Config(),
+        audio_backend=audio,  # type: ignore[arg-type]
+        beat_dance=beat,  # type: ignore[arg-type]
+    )
+    reply = await engine.start_ambient_dance()
+    assert "听外面的音乐" in reply
+    assert engine._dance_loop_active
+    assert engine._ambient_dance_active
+    assert beat.ambient_started == 1
+    assert beat.started == 0
+    await asyncio.sleep(0.05)
+    assert not audio.plays
+    assert audio.chunks
+    status = engine.runtime_status()
+    assert status["dance_source"] == "ambient"
+    assert status["dance_track_title"] == "现场音乐"
+    reply2 = await engine.start_ambient_dance()
+    assert "已经在跳" in reply2
+    reply3 = await engine.stop_beat_dance()
+    assert "停啦" in reply3
+    assert not engine._ambient_dance_active
+    assert not engine._dance_loop_active
+    assert beat.stopped == 1
+
+
+@pytest.mark.asyncio
+async def test_ambient_voice_command_starts_listen_dance() -> None:
+    audio = _MusicFakeAudio()
+    beat = _FakeBeatDance()
+    engine = ConversationEngine(
+        Config(),
+        audio_backend=audio,  # type: ignore[arg-type]
+        beat_dance=beat,  # type: ignore[arg-type]
+    )
+    reply = await engine._execute_deterministic_motion("跟着音乐跳")
+    assert "听外面的音乐" in reply
+    assert engine._ambient_dance_active
+    assert engine._state == "dancing"
+    await engine.stop_beat_dance()
+
+
+@pytest.mark.asyncio
+async def test_start_ambient_dance_without_mic() -> None:
+    engine = ConversationEngine(Config(), beat_dance=_FakeBeatDance())  # type: ignore[arg-type]
+    reply = await engine.start_ambient_dance()
+    assert "麦克风" in reply
+    assert not engine._ambient_dance_active
 
 
 @pytest.mark.asyncio

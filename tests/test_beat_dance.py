@@ -18,6 +18,7 @@ from chaihuo_reachy.beat_dance import (
     _load_timeline,
     _timeline_from_audio,
 )
+from chaihuo_reachy.music import AmbientBeatTracker
 
 PITCH_BASE_MAX = 22.0  # pitch soft cap
 
@@ -74,6 +75,40 @@ def test_load_timeline_smooths_buckets(tmp_path) -> None:
 
 def _beat(energy: str = "MID", strength: float = 0.5) -> dict:
     return {"time": 0.0, "strength": strength, "energy_bucket": energy}
+
+
+def test_synthesizer_jumps_on_the_beat() -> None:
+    synth = BeatMotionSynthesizer(beat_interval=0.5)
+    synth.on_run_start()
+    zs: list[float] = []
+    for t in np.linspace(0.0, 0.5, 26):
+        _, _, _, status = synth.synthesize(t, _beat("PEAK", 0.9), 0.0)
+        zs.append(status["z_mm"])
+    peak_at = int(np.argmax(zs))
+    assert max(zs) >= 8.0
+    assert peak_at < 13
+    assert zs[peak_at] > zs[-1] + 3.0
+    assert zs[0] < zs[peak_at]
+
+
+def test_synthesizer_rises_from_bottom_during_buildup() -> None:
+    synth = BeatMotionSynthesizer(beat_interval=0.5)
+    synth.on_run_start()
+    beat = _beat("MID", 0.6)
+    beat["buildup"] = 0.8
+
+    def peak_z(start: float) -> float:
+        zs = []
+        for t in np.linspace(start, start + 0.5, 16):
+            _, _, _, status = synth.synthesize(t, beat, start)
+            zs.append(status["z_mm"])
+        return max(zs)
+
+    early = peak_z(0.0)
+    assert synth.rise_level <= 0.25
+    late = peak_z(5.0)
+    assert synth.rise_level > 0.7
+    assert late > early + 5.0
 
 
 def test_synthesizer_outputs_respect_soft_caps() -> None:
@@ -223,6 +258,28 @@ def test_controller_generates_timeline_when_missing(tmp_path) -> None:
     assert (tmp_path / "dance" / "missing.json").is_file()
     ctl.stop()
     assert not ctl.is_active
+
+
+def test_controller_start_ambient_without_local_file(tmp_path) -> None:
+    from chaihuo_reachy.config import Config
+
+    reachy = _FakeReachy()
+    cfg = Config(
+        beat_timeline_path=str(tmp_path / "missing.json"),
+        beat_music_path=str(tmp_path / "missing.wav"),
+    )
+    ctl = BeatDanceController(reachy, cfg)
+    tracker = AmbientBeatTracker(sample_rate=16000)
+    assert ctl.start_ambient(tracker)
+    time.sleep(0.15)
+    assert ctl.is_active
+    assert ctl.track_title == "现场音乐"
+    assert ctl.status()["source"] == "ambient"
+    assert len(reachy.targets) > 0
+    assert ctl.start_ambient(tracker) is False
+    ctl.stop()
+    assert not ctl.is_active
+    assert reachy.neutral_calls == 1
 
 
 def test_controller_start_without_timeline_returns_none(tmp_path) -> None:

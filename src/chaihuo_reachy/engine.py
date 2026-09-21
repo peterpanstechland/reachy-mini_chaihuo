@@ -351,6 +351,8 @@ class ConversationEngine:
         self._motion = motion
         self._beat_dance = beat_dance  # BeatDanceController | None
         self._dance_loop_active = False
+        self._ambient_dance_active = False
+        self._ambient_listen_task: asyncio.Task[None] | None = None
         self._beat_music_task: asyncio.Task | None = None
         self._bgm_task: asyncio.Task[None] | None = None
         self._bgm_motion_task: asyncio.Task[None] | None = None
@@ -1881,7 +1883,8 @@ class ConversationEngine:
             self._active_response_tools = []
             self._active_response_tool_handler = None
             self._last_activity = time.monotonic()
-            self._set_state("idle")
+            if not self._dance_loop_active:
+                self._set_state("idle")
             self._emit_turn_event("turn_status", status="error" if error else "done")
 
         return {
@@ -2096,6 +2099,11 @@ class ConversationEngine:
             style = "happy"
         elif "随便" in text or "随机" in text or "随意" in text or "自由" in text:
             style = "random"
+        if any(
+            term in text
+            for term in ("跟着音乐", "听着音乐", "外面的音乐", "现场音乐", "听歌跳")
+        ):
+            return await self.start_ambient_dance()
         if "跳" in text or "舞" in text:
             return await self._tool_dance(style)
         if "点头" in text:
@@ -2660,6 +2668,9 @@ class ConversationEngine:
         now = time.monotonic()
         dance_status: dict[str, object] = {
             "dance_loop_active": self._dance_loop_active,
+            "dance_source": "ambient"
+            if self._ambient_dance_active
+            else ("file" if self._dance_loop_active else ""),
         }
         if self._beat_dance is not None:
             dance_status["dance_track_title"] = getattr(
@@ -2667,6 +2678,9 @@ class ConversationEngine:
             )
             if self._dance_loop_active:
                 dance_status.update(self._beat_dance.status())
+                live = self._beat_dance.status()
+                if live.get("tempo"):
+                    dance_status["dance_bpm"] = live.get("tempo")
         if self._audio:
             ri = self._audio.resolved_info
             audio = ri if isinstance(ri, dict) else ri.to_dict()
@@ -2802,6 +2816,21 @@ class ConversationEngine:
                 "turn_id": "",
             }
         if self._dance_loop_active:
+            if any(
+                term in normalized
+                for term in ("停下", "停止", "别跳", "停跳", "停止跳舞")
+            ):
+                await self.stop_beat_dance()
+                return {
+                    "reply": "停啦",
+                    "emotion": "",
+                    "memory_context": "",
+                    "vision_context": "",
+                    "intent": TurnIntent.GENERAL.value,
+                    "sources": [],
+                    "error": "",
+                    "turn_id": "",
+                }
             return {
                 "reply": "正在跳舞，等音乐停了再聊吧～",
                 "emotion": "",
@@ -3415,6 +3444,7 @@ class ConversationEngine:
         """
         if self._tts_playing or self._state in ("speaking", "thinking"):
             logger.info("🎵 连跳接管：取消当前回答")
+        await self._cancel_voice_listener()
         # Abort the in-flight reply through the existing barge-in path
         # (the watcher exits without calling stop_playback()).
         self._barge_in_requested = True
@@ -3434,6 +3464,49 @@ class ConversationEngine:
             await asyncio.sleep(0.01)
         if self._audio is not None:
             self._audio.stop_playback()
+
+    async def start_ambient_dance(self) -> str:
+        """Listen to room music and dance on the detected beat."""
+        if self._beat_dance is None:
+            return "节拍连跳未启用（缺少 beat 控制器）"
+        if self._audio is None:
+            return "没有麦克风，听不到外面的音乐"
+        if self._dance_loop_active or getattr(self._beat_dance, "is_active", False):
+            return "已经在跳啦"
+        if self._bgm_active:
+            await self.stop_bgm(resume_conversation=False)
+        from chaihuo_reachy.music import AmbientBeatTracker
+
+        await self._suspend_voice_for_dance()
+        sample_rate = int(
+            getattr(self._audio, "input_sr", 0)
+            or self.config.audio_sample_rate
+            or 16000
+        )
+        tracker = AmbientBeatTracker(sample_rate=sample_rate)
+        if not self._beat_dance.start_ambient(tracker):
+            await self.stop_beat_dance()
+            return "没法开始听歌跳舞"
+        self._ambient_dance_active = True
+        self._dance_loop_active = True
+        self._set_state("dancing")
+        self._ambient_listen_task = asyncio.create_task(
+            self._feed_ambient_beats(tracker), name="ambient-dance-listen"
+        )
+        logger.info("🎵 听歌跳舞开始（语音挂起）")
+        return "我在听外面的音乐，对上拍就跳。再点一次或说停下。"
+
+    async def _feed_ambient_beats(self, tracker: Any) -> None:
+        assert self._audio is not None
+        try:
+            async for chunk in self._audio.start_capture():
+                if not self._ambient_dance_active:
+                    break
+                tracker.push(chunk)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("现场节拍采集失败")
 
     async def start_beat_dance(self) -> str:
         """Start the infinite beat dance. Returns a user-facing message."""
@@ -3469,6 +3542,14 @@ class ConversationEngine:
 
     async def stop_beat_dance(self) -> str:
         """Stop the infinite beat dance and resume conversation."""
+        self._ambient_dance_active = False
+        if self._ambient_listen_task is not None:
+            self._ambient_listen_task.cancel()
+            try:
+                await self._ambient_listen_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._ambient_listen_task = None
         if self._beat_music_task is not None:
             self._beat_music_task.cancel()
             try:

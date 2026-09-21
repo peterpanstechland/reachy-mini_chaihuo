@@ -49,6 +49,24 @@ def test_dashboard_volume_mapping_preserves_default_and_expands_maximum() -> Non
     assert playback_percent_from_gain(8.0) == 100
 
 
+def test_auto_accepts_reachy_usb_when_portaudio_hides_playback() -> None:
+    devices = [
+        {
+            "name": "Reachy Mini Audio: USB Audio (hw:2,0)",
+            "max_input_channels": 2,
+            "max_output_channels": 0,
+            "default_samplerate": 16000,
+        },
+        DEVICES[1],
+        DEVICES[2],
+        DEVICES[3],
+    ]
+    info = resolve_audio_device("auto", devices=devices)
+    assert info.input_index == info.output_index == 0
+    assert info.max_input_channels == 2
+    assert info.max_output_channels == 2
+
+
 def test_auto_selects_unique_reachy_duplex_and_rejects_camera_audio() -> None:
     info = resolve_audio_device("auto", devices=DEVICES)
     assert info.input_index == info.output_index == 0

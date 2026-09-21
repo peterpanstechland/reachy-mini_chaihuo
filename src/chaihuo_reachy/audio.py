@@ -181,6 +181,29 @@ def _candidate_summary(devices: list[dict[str, object]]) -> str:
     )
 
 
+def _is_reachy_card(device: dict[str, object]) -> bool:
+    name = _normalized_device_name(device.get("name", ""))
+    return _REACHY_DEVICE_NAME in name and "camera" not in name
+
+
+def _xmos_duplex_channels(device: dict[str, object]) -> tuple[int, int] | None:
+    """XMOS is 2-in/2-out; PortAudio often hides one side after exclusive use."""
+    if not _is_reachy_card(device):
+        return None
+    reported_in = int(device.get("max_input_channels", 0))
+    reported_out = int(device.get("max_output_channels", 0))
+    if reported_in < 1 and reported_out < 1:
+        return None
+    if reported_in >= 1 and reported_out >= 1:
+        return reported_in, reported_out
+    logger.warning(
+        "PortAudio 把 Reachy Mini 报成 in=%d out=%d，按 XMOS 2-in/2-out 继续",
+        reported_in,
+        reported_out,
+    )
+    return max(reported_in, 2), max(reported_out, 2)
+
+
 def _validate_index(
     devices: list[dict[str, object]], index: int, role: str
 ) -> dict[str, object]:
@@ -200,8 +223,14 @@ def _build_info(
 ) -> AudioDeviceInfo:
     input_device = _validate_index(devices, input_index, "input")
     output_device = _validate_index(devices, output_index, "output")
-    in_channels = int(input_device.get("max_input_channels", 0))
-    out_channels = int(output_device.get("max_output_channels", 0))
+    native = _xmos_duplex_channels(input_device) or _xmos_duplex_channels(
+        output_device
+    )
+    if native is not None:
+        in_channels, out_channels = native
+    else:
+        in_channels = int(input_device.get("max_input_channels", 0))
+        out_channels = int(output_device.get("max_output_channels", 0))
     if in_channels < 1 or out_channels < 1:
         raise AudioDeviceResolutionError(
             f"Audio selector {selector!r} is not full duplex: input "
@@ -242,13 +271,7 @@ def resolve_audio_device(
 
     if normalized_selector in ("", "auto"):
         def _is_reachy_duplex(device: dict[str, object]) -> bool:
-            name = _normalized_device_name(device.get("name", ""))
-            return (
-                _REACHY_DEVICE_NAME in name
-                and "camera" not in name
-                and int(device.get("max_input_channels", 0)) > 0
-                and int(device.get("max_output_channels", 0)) > 0
-            )
+            return _xmos_duplex_channels(device) is not None
 
         candidates = [
             index for index, device in enumerate(table) if _is_reachy_duplex(device)

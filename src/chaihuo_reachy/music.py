@@ -10,9 +10,14 @@ back to a default beat length and the dance simply runs at that tempo.
 from __future__ import annotations
 
 import logging
+import math
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
+
+from chaihuo_reachy.audio_frontend import pcm16_rms
 
 logger = logging.getLogger("chaihuo_reachy.music")
 
@@ -127,11 +132,8 @@ def load_audio(path: Path, target_sr: int | None = None) -> tuple[int, bytes] | 
     return info
 
 
-def detect_bpm(pcm: bytes, sr: int) -> float | None:
-    """Estimate the tempo of a 16-bit mono PCM buffer (energy autocorrelation).
-
-    Returns BPM in [70, 180] or None when no stable beat is found.
-    """
+def _energy_envelope(pcm: bytes, sr: int) -> tuple[np.ndarray, float] | None:
+    """RMS frames for BPM and buildup. Same window ``detect_bpm`` uses."""
     x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
     frame = max(1, int(sr * _ENVELOPE_FRAME_S))
     n_frames = len(x) // frame
@@ -140,10 +142,12 @@ def detect_bpm(pcm: bytes, sr: int) -> float | None:
     env = np.sqrt(
         np.mean(x[: n_frames * frame].reshape(n_frames, frame) ** 2, axis=1)
     )
-    env = env - env.mean()
-    env_fps = sr / frame  # envelope frames per second
+    return env, sr / frame
 
-    ac = np.correlate(env, env, mode="full")[len(env) - 1 :]
+
+def _bpm_from_envelope(env: np.ndarray, env_fps: float) -> float | None:
+    centered = env - env.mean()
+    ac = np.correlate(centered, centered, mode="full")[len(centered) - 1 :]
     # Ignore the first 0.1 s (self-lag) — we want the first beat period.
     ac[: max(1, int(0.1 * env_fps))] = 0.0
 
@@ -155,5 +159,107 @@ def detect_bpm(pcm: bytes, sr: int) -> float | None:
     if seg.size == 0 or float(seg.max()) <= 0.0:
         return None
     lag = lag_min + int(np.argmax(seg))
-    bpm = 60.0 / (lag / env_fps)
-    return round(bpm, 1)
+    return round(60.0 / (lag / env_fps), 1)
+
+
+def detect_bpm(pcm: bytes, sr: int) -> float | None:
+    """Estimate the tempo of a 16-bit mono PCM buffer (energy autocorrelation).
+
+    Returns BPM in [70, 180] or None when no stable beat is found.
+    """
+    info = _energy_envelope(pcm, sr)
+    if info is None:
+        return None
+    return _bpm_from_envelope(*info)
+
+
+class AmbientBeatTracker:
+    """Rolling mic window → BPM + beat phase for live dance.
+
+    Reuses ``detect_bpm`` on a few seconds of capture. Motion stays on a
+    tempo grid snapped to the latest onset so the robot can follow room
+    music without playing a local file.
+    """
+
+    def __init__(self, sample_rate: int = 16000, window_s: float = 6.0) -> None:
+        self.sample_rate = max(8000, int(sample_rate or 16000))
+        self._window_bytes = self.sample_rate * 2 * max(3, int(window_s))
+        self._pcm = bytearray()
+        self._lock = threading.Lock()
+        self._bpm = 120.0
+        self._bpm_locked = False
+        self._last_bpm_at = 0.0
+        self._last_onset = 0.0
+        self._noise = 0.012
+        self._rms = 0.0
+        self._buildup = 0.0
+
+    @property
+    def bpm(self) -> float:
+        with self._lock:
+            return self._bpm
+
+    @property
+    def rms(self) -> float:
+        with self._lock:
+            return self._rms
+
+    @property
+    def buildup(self) -> float:
+        with self._lock:
+            return self._buildup
+
+    def push(self, pcm: bytes, *, now: float | None = None) -> None:
+        if not pcm:
+            return
+        now = time.monotonic() if now is None else now
+        rms = pcm16_rms(pcm)
+        with self._lock:
+            self._pcm.extend(pcm)
+            overflow = len(self._pcm) - self._window_bytes
+            if overflow > 0:
+                del self._pcm[:overflow]
+            self._rms = rms
+            if rms < self._noise * 1.5:
+                self._noise = 0.95 * self._noise + 0.05 * max(rms, 1e-4)
+            min_gap = 60.0 / _MAX_BPM
+            if rms >= max(self._noise * 2.4, 0.018) and now - self._last_onset >= min_gap:
+                self._last_onset = now
+            if now - self._last_bpm_at < 1.5:
+                return
+            if len(self._pcm) < self.sample_rate * 2 * 3:
+                return
+            info = _energy_envelope(bytes(self._pcm), self.sample_rate)
+            self._last_bpm_at = now
+            if info is None:
+                return
+            env, env_fps = info
+            half = max(1, env.size // 2)
+            early = float(np.mean(env[:half]))
+            late = float(np.mean(env[half:]))
+            climb = min(1.0, max(0.0, (late / max(early, 1e-4) - 1.0) / 0.7))
+            if self._buildup == 0.0:
+                self._buildup = climb
+            else:
+                self._buildup = 0.7 * self._buildup + 0.3 * climb
+            estimated = _bpm_from_envelope(env, env_fps)
+            if estimated is None:
+                return
+            if not self._bpm_locked:
+                self._bpm = estimated
+                self._bpm_locked = True
+            else:
+                self._bpm = round(0.7 * self._bpm + 0.3 * estimated, 1)
+
+    def beat_for_elapsed(self, elapsed: float, origin: float) -> tuple[dict[str, float], float]:
+        with self._lock:
+            bpm = self._bpm
+            rms = self._rms
+            last_onset = self._last_onset
+            buildup = self._buildup
+        interval = 60.0 / bpm if bpm > 0 else 0.5
+        phase0 = ((last_onset - origin) % interval) if last_onset > 0 else 0.0
+        beat_index = math.floor((elapsed - phase0) / interval)
+        beat_time = phase0 + max(0, beat_index) * interval
+        strength = min(1.0, max(0.25, rms / 0.08))
+        return {"strength": strength, "rms": rms, "buildup": buildup}, beat_time
