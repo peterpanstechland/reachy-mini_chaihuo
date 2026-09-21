@@ -153,6 +153,19 @@ def test_browser_uses_page_host_and_normalized_chat_protocol() -> None:
     assert 'id="gesturePreviewOverlay"' in DASHBOARD_HTML
     assert "setGesturePreview(gestureActive" in DASHBOARD_HTML
     assert 'cam.src="/camera/stream"' in DASHBOARD_HTML
+    assert 'id="showEditor"' in DASHBOARD_HTML
+    assert 'id="showEditorBtn"' in DASHBOARD_HTML
+    assert 'id="showHistory"' in DASHBOARD_HTML
+    assert 'id="showScript"' in DASHBOARD_HTML
+    assert 'id="showBrief"' in DASHBOARD_HTML
+    assert 'id="showDuration"' in DASHBOARD_HTML
+    assert 'id="showDialect"' in DASHBOARD_HTML
+    assert "文案配置" in DASHBOARD_HTML
+    assert "function setShowEditor" in DASHBOARD_HTML
+    assert 'type:"show_content"' in DASHBOARD_HTML
+    assert 'm.type==="show_content"' in DASHBOARD_HTML
+    assert 'm.type==="show_content_status"' in DASHBOARD_HTML
+    assert "保存并转语音" in DASHBOARD_HTML
 
 
 def test_dashboard_embeds_daemon_link_controls() -> None:
@@ -164,6 +177,9 @@ def test_dashboard_embeds_daemon_link_controls() -> None:
     assert "await _try_connect_daemon(cfg)" in source
     assert "await _close_reachy_runtime(current)" in source
     assert "await _stop_recorded_move()" in source
+    assert 'event_type == "show_content"' in source
+    assert "handle_show_content_action" in source
+    assert "show_content_busy" in source
 
 
 def test_opening_show_respects_live_dashboard_volume() -> None:

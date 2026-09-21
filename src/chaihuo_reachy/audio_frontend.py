@@ -59,11 +59,16 @@ def circular_distance_deg(a: float, b: float) -> float:
 class SileroVAD:
     """Small stateful ONNX wrapper; unavailable models fail closed to fallback."""
 
+    # Official 16 kHz Silero streaming export only accepts this hop.
+    # 100 ms capture chunks are 1600 samples and will crash LSTM if fed whole.
+    _FRAME = 512
+
     def __init__(self, model_path: str, sample_rate: int = 16000) -> None:
         self.available = False
         self._session = None
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
         self._sr = np.array(sample_rate, dtype=np.int64)
+        self._pending = np.zeros(0, dtype=np.float32)
         path = Path(model_path)
         if not path.is_file():
             return
@@ -79,32 +84,47 @@ class SileroVAD:
 
     def reset(self) -> None:
         self._state.fill(0)
+        self._pending = np.zeros(0, dtype=np.float32)
 
     def probability(self, pcm: bytes) -> float | None:
         if self._session is None:
             return None
-        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-        if not samples.size:
-            return 0.0
-        # Current Silero streaming exports accept arbitrary multiples of a
-        # frame; pad very short backend chunks to the canonical 512 samples.
-        if len(samples) < 512:
-            samples = np.pad(samples, (0, 512 - len(samples)))
-        try:
-            output, state = self._session.run(
-                None,
-                {
-                    "input": samples.reshape(1, -1),
-                    "state": self._state,
-                    "sr": self._sr,
-                },
-            )
-            self._state = state
-            return max(0.0, min(1.0, float(np.asarray(output).squeeze())))
-        except Exception:
-            self.available = False
-            self._session = None
-            return None
+        incoming = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        samples = (
+            np.concatenate((self._pending, incoming))
+            if self._pending.size
+            else incoming
+        )
+        last: float | None = None
+        view = samples
+        while view.size >= self._FRAME:
+            frame = view[: self._FRAME]
+            view = view[self._FRAME :]
+            try:
+                output, state = self._session.run(
+                    None,
+                    {
+                        "input": frame.reshape(1, self._FRAME),
+                        "state": self._state,
+                        "sr": self._sr,
+                    },
+                )
+            except Exception:
+                self._pending = np.array(view, copy=True)
+                return last
+            state_arr = np.asarray(state, dtype=np.float32)
+            if state_arr.shape != self._state.shape:
+                try:
+                    state_arr = state_arr.reshape(self._state.shape)
+                except ValueError:
+                    self._pending = np.array(view, copy=True)
+                    return last
+            self._state = state_arr
+            last = max(0.0, min(1.0, float(np.asarray(output).squeeze())))
+        self._pending = np.array(view, copy=True)
+        if last is not None:
+            return last
+        return 0.0
 
 
 @dataclass

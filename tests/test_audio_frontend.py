@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 from chaihuo_reachy.audio_frontend import (
     DirectionGate,
+    SileroVAD,
     SpeechEndpoint,
     adaptive_energy_threshold,
     circular_distance_deg,
@@ -47,6 +50,20 @@ def test_direction_gate_mutes_only_after_persistent_mismatch() -> None:
     assert gate.accepts(90, now=0.1)
     assert not gate.accepts(90, now=0.91)
     assert gate.accepts(5, now=1.0)
+
+
+def test_silero_windows_100ms_chunks_without_disabling() -> None:
+    path = Path("models/vad/silero_vad.onnx")
+    if not path.is_file():
+        pytest.skip("Silero VAD model is not downloaded")
+    vad = SileroVAD(str(path), 16000)
+    assert vad.available
+    chunk = (np.random.randn(1600) * 400).astype(np.int16).tobytes()
+    first = vad.probability(chunk)
+    second = vad.probability(chunk)
+    assert first is not None
+    assert second is not None
+    assert vad.available
 
 
 def test_endpoint_forces_turn_end_after_silence() -> None:

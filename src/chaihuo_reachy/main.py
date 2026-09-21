@@ -32,6 +32,11 @@ from chaihuo_reachy.opening import (
     load_opening_audio,
     load_training_faq_items,
 )
+from chaihuo_reachy.show_content import (
+    ShowLibrary,
+    handle_show_content_action,
+    location_text_from_engine,
+)
 from chaihuo_reachy import daemon_http, daemon_runtime
 from chaihuo_reachy.backends.interfaces import (
     playback_gain_from_percent,
@@ -844,6 +849,8 @@ async def run_dashboard(
     show_task: asyncio.Task[None] | None = None
     show_active = False
     show_kind = ""
+    show_library = ShowLibrary()
+    show_content_busy = False
     training_faq_items = load_training_faq_items()
     robot_link = daemon_http.summarize_robot_link(None, sdk_status)
     recorded_move_uuid: str | None = None
@@ -855,6 +862,7 @@ async def run_dashboard(
             "opening_active": show_active and show_kind == "opening",
             "training_active": show_active and show_kind == "training",
             "training_faq": training_faq_items,
+            "show_content_busy": show_content_busy,
         }
 
     def _compose_runtime() -> dict[str, Any]:
@@ -1219,6 +1227,7 @@ async def run_dashboard(
                     "active": show_active and show_kind == "training",
                 },
                 {"type": "training_faq", "items": training_faq_items},
+                {"type": "show_content_status", "busy": show_content_busy},
                 {
                     "type": "bgm_status",
                     "active": engine._bgm_active,
@@ -1241,6 +1250,57 @@ async def run_dashboard(
                 chat.history_event(),
             ]
 
+        async def _handle_show_content(client: WebSocket, data: dict[str, Any]) -> None:
+            nonlocal show_content_busy
+            action = str(data.get("action") or "list")
+            if action in {"generate", "save_tts"}:
+                if show_active:
+                    current = LOCAL_SHOWS.get(show_kind)
+                    label = current.label if current is not None else "讲解"
+                    await client.send_json(
+                        {"type": "error", "message": f"{label}演出中，请先停止播放再改文案"}
+                    )
+                    return
+                if show_content_busy:
+                    await client.send_json(
+                        {"type": "error", "message": "文案正在生成或转语音"}
+                    )
+                    return
+                show_content_busy = True
+                broadcast(
+                    {
+                        "type": "show_content_status",
+                        "busy": True,
+                        "action": action,
+                        "kind": str(data.get("kind") or "opening"),
+                    }
+                )
+                try:
+                    payload = await handle_show_content_action(
+                        show_library,
+                        cfg,
+                        data,
+                        location_text=location_text_from_engine(engine),
+                    )
+                    broadcast(payload)
+                except Exception as exc:
+                    logger.exception("show_content %s failed", action)
+                    await client.send_json({"type": "error", "message": str(exc)})
+                finally:
+                    show_content_busy = False
+                    broadcast({"type": "show_content_status", "busy": False})
+                return
+            try:
+                payload = await handle_show_content_action(
+                    show_library,
+                    cfg,
+                    data,
+                    location_text=location_text_from_engine(engine),
+                )
+                await client.send_json(payload)
+            except Exception as exc:
+                await client.send_json({"type": "error", "message": str(exc)})
+
         async def _handle_control(client: WebSocket, data: dict[str, Any]) -> None:
             nonlocal show_active, show_kind, show_task
             event_type = data.get("type", "")
@@ -1250,6 +1310,14 @@ async def run_dashboard(
             )
             if show_spec is not None:
                 action = str(data.get("action") or "play")
+                if action != "stop" and show_content_busy:
+                    await client.send_json(
+                        {
+                            "type": "error",
+                            "message": "文案正在生成或转语音，请稍候再播放",
+                        }
+                    )
+                    return
                 if action == "stop":
                     if show_task is not None:
                         if engine._audio is not None:
@@ -1297,6 +1365,9 @@ async def run_dashboard(
                     }
                 )
                 show_task = asyncio.create_task(_run_opening_show(audio, show_spec))
+                return
+            if event_type == "show_content":
+                await _handle_show_content(client, data)
                 return
             if show_active and event_type not in {
                 "get_volume",
